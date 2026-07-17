@@ -1,0 +1,60 @@
+# SFT config for layer1_delta — MAIProfile
+# Used by scripts/sft_train.py via --config configs/sft/layer1_delta.yaml
+#
+# Key differences from layer0_signal:
+#   * 3-message format (system / user / assistant) — no fixed few-shot demo pair
+#     (scripts/sft_train.py masks everything except the last assistant message,
+#      so this is handled transparently.)
+#   * Output is much longer: completion_tokens p95 ≈ 2.2k, p99 ≈ 3.8k, max ≈ 11k
+#   * Total seq p95 ≈ 5.1k, p99 ≈ 9.3k → max_seq_len 8192 keeps ~98.6% intact
+
+step_key: layer1_delta
+
+# Base model — same 4B base as layer0 (non-thinking, matches teacher with reasoning_effort=none)
+base_model: /home/aiscuser/Models/Qwen3-4B-Instruct-2507
+
+# Data
+train_jsonl: /home/aiscuser/MAIProfileSFT/data/splits/layer1_delta/train.jsonl
+val_jsonl:   /home/aiscuser/MAIProfileSFT/data/splits/layer1_delta/val.jsonl
+
+# Output (local fast SSD; sync to persistent at end of training)
+output_dir: /home/aiscuser/MAIProfileSFT_runs/layer1_delta-qwen3-4b-instruct-v1
+
+# Hyperparameters — adjusted for longer sequences and smaller dataset (3645 train)
+max_seq_len: 8192                  # vs 5120 for layer0; keeps ~98.6% of train+val intact
+per_device_train_batch_size: 2     # halved from layer0 due to ~1.6x longer seq
+per_device_eval_batch_size:  2
+gradient_accumulation_steps: 2     # 8 GPU * 2 * 2 = effective batch 32 (matches layer0)
+num_train_epochs: 3
+learning_rate: 5.0e-6
+weight_decay: 0.0
+warmup_ratio: 0.03
+lr_scheduler_type: cosine
+seed: 42
+
+# Logging / eval / checkpointing — denser eval because dataset is smaller (~114 steps/epoch)
+logging_steps: 5
+eval_strategy: steps
+eval_steps: 25
+save_strategy: steps
+save_steps: 25
+save_total_limit: 3
+
+# Efficiency
+gradient_checkpointing: true
+attn_implementation: sdpa          # change to flash_attention_2 if installed
+
+# DeepSpeed ZeRO-3
+deepspeed_config: /home/aiscuser/MAIProfileSFT/configs/deepspeed/ds_config_zero3.json
+
+# Resume policy
+resume_from_checkpoint: auto
+
+# WandB
+wandb_project: maiprofile-sft
+wandb_run_name: layer1_delta-qwen3-4b-instruct-v1
+wandb_tags:
+  - layer1_delta
+  - sft
+  - qwen3-4b-instruct
+  - a100

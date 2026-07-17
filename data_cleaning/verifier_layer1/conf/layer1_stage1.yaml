@@ -1,0 +1,132 @@
+# Hydra config for Layer1 delta RL — Stage 1.
+#
+# Forks QED-Nano's `proof_demo-thinking` (which targets 4B thinking model on
+# Qwen3-style chat templates). Anything not overridden here is inherited from
+# the base config chain.
+#
+# DROP-IN PATH:  QED-Nano/training/conf/layer1_stage1.yaml
+# LAUNCH:
+#   timestamp=$(date +'%Y%m%d-%H%M%S')
+#   python -m pipelinerl.launch --config-name=layer1_stage1 \
+#     output_dir="tmp/results/layer1_stage1-${timestamp}"
+#
+# BEFORE LAUNCHING:
+#   - Replace ${SFT_50K_PATH} below with the actual local path to the sft-50K
+#     checkpoint directory (HF-format).
+#   - Start the verifier server alongside training:
+#       cd training && LAYER1_STAGE=1 \
+#         uvicorn verifier_layer1.server:app --host 0.0.0.0 --port 8001
+#     OR add the server to the launcher (TODO: integrate via a custom
+#     `verifier` entrypoint similar to QED-Nano's `verifier.py`).
+#   - Build the training dataset at training/data/layer1_delta/train_hard.jsonl
+#     (see data_prep/ for the script). Each record must include
+#     `metadata.input_signals` so the verifier can score fidelity.
+
+defaults:
+  - proof_demo-thinking      # inherit the 4B-thinking actor + GRPO defaults
+  - _self_
+
+# ---------------------------------------------------------------------------
+# Model paths
+# ---------------------------------------------------------------------------
+actor:
+  model_path: ${SFT_50K_PATH}        # ← replace at launch time
+  sampling:
+    temperature: 1.0
+    top_p: 0.95
+    max_tokens: 4096                 # Layer1 outputs are shorter than proofs
+    n: 8                             # GRPO group size
+
+reference_llm:
+  model_path: ${SFT_50K_PATH}        # KL anchor == policy init
+
+# ---------------------------------------------------------------------------
+# Verifier (our custom reward server)
+# ---------------------------------------------------------------------------
+verifier:
+  type: layer1
+  url: http://localhost:8001
+  health_check_path: /health
+  timeout_s: 30
+
+# Reward config — read by the verifier server via LAYER1_REWARD_CONFIG env.
+# Kept here for documentation / reproducibility; the server doesn't currently
+# read it via Hydra (that's a TODO for the verifier integration).
+reward:
+  stage: 1
+  gate:
+    mode: soft                       # start soft; flip to "hard" once schema_rate ≥ 0.95
+    soft_value: 0.1
+  count_length:
+    count_band: [2, 9]               # ← set to P10/P90 of n_interests in training set
+    length_band: [200, 2000]         # ← set to P10/P90 of completion chars
+    taper: 0.0
+  fidelity:
+    coverage_floor: 0.3
+    min_action_chars: 3
+  weights:
+    anti_collapse: 0.5
+    anti_hallucination: 0.4
+    fidelity: 0.1
+
+# ---------------------------------------------------------------------------
+# Training schedule
+# ---------------------------------------------------------------------------
+finetune:
+  kl_coef: 0.02                      # tune in [0.005, 0.05]; watch KL curve
+  max_steps: 3000                    # hard cap (see exit conditions below)
+  weight_update_interval: 16
+  optimizer:
+    lr: 5.0e-7                       # conservative on full-param 4B; raise to 1e-6 if reward stalls
+  early_stop:
+    enabled: true
+    monitor: holdout_m1_f1
+    threshold: 0.595                 # 95% of sft-50K baseline 0.626
+    patience_steps: 200
+    abort_on:
+      - {metric: kl_to_ref, op: ">", value: 10, patience: 0}
+      - {metric: entropy_drop_pct, op: ">", value: 0.5, patience: 200}
+      - {metric: mean_n_interests, op: "<", value: 1.5, patience: 200}
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+dataset:
+  train: training/data/layer1_delta/train_hard.jsonl
+  eval: training/data/layer1_delta/eval_holdout.jsonl
+  eval_every_steps: 500
+  eval_samples: 200
+
+# ---------------------------------------------------------------------------
+# GPU layout for 2 × 8 × A100 80G  (16 GPUs total)
+# ---------------------------------------------------------------------------
+world:
+  trainer_fraction: 0.50             # 8 GPUs trainer (Node 0)
+  actor_fraction: 0.375              # 6 GPUs actor / vLLM
+  preprocessor_fraction: 0.0625      # 1 GPU reference LLM
+  verifier_fraction: 0.0625          # 1 GPU reserved (CPU is fine for stage 1;
+                                     # reserve for stage 2 RM)
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+wandb:
+  project: maiprofile-layer1-rl
+  tags: ["layer1", "stage1", "qwen3-4b-thinking"]
+  log_components: true               # log every reward sub-component per batch
+
+# ---------------------------------------------------------------------------
+# Exit conditions (documentation only — wired in early_stop above)
+# ---------------------------------------------------------------------------
+# Stage 1 exits when ALL three hold for ≥500 consecutive steps:
+#   1. schema_rate(rolling-200) ≥ 0.97
+#   2. mean(reward, rolling-200) change < 5% over last 500 steps
+#   3. holdout_m1_f1 ≥ 0.595
+# OR max_steps = 3000 is reached (hard cap).
+#
+# Abort conditions (any one triggers shutdown for diagnosis):
+#   - holdout_m1_f1 < 0.55 for 200 consecutive eval points
+#   - kl_to_ref > 10 nats
+#   - entropy drop > 50% from initial
+#   - mean(n_interests) < 0.5 × training-set median
+#   - pct(verbatim_evidence_copy) > 30%

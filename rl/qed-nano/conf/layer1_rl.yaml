@@ -1,0 +1,189 @@
+# ---------------------------------------------------------------------------
+# Layer1-delta Stage-4 RL reproduction (single node).
+#
+# Reward (lowered-w_rule variant, 2026-06-27):
+#   r = gate * ( 0.1 * r_rule + 0.9 * r_llm )
+#   r_rule = 0.5*anti_collapse[2b] + 0.4*anti_hallucination + 0.1*fidelity_score
+#   r_llm  = (w_u*utility + w_p*precision [+ w_rec*recall]) / sum(active w)
+#            (M2 interest judge, Azure). Defaults below = 0.5/0.5 (no recall).
+#   Recall reward (interest-coverage vs pre-generated grounded candidates) is
+#   opt-in: set env LAYER1_RECALL_ENABLED=1 + LAYER1_RECALL_CANDIDATES_DIR=<dir>
+#   and override reward.llm_weights.{utility,precision,recall} (e.g. 0.3/0.4/0.3).
+#   Rationale: Pass-B SFT analysis shows the rule term is near-constant within
+#   groups (~43% rule-std<=0.012), diluting the GRPO gradient. Lowering w_rule
+#   robustly raises usable-group fraction 1.45-1.76x across all std thresholds.
+#   Single-variable change (no data cleaning) for clean attribution.
+#
+# In-process reward (no HTTP verifier). Judge is a direct Azure call gated by
+# LAYER1_JUDGE_ENABLED=1; with it unset the loop is rule-only (smoke mode).
+#
+# Default world targets a single node with 7 free GPUs (GPU0 is held by another
+# process). KL is on (ref = the SFT-50K init), so a preprocessor LLM is placed.
+#
+# Smoke (cheap, rule-only, no ref model) via CLI overrides, e.g.:
+#   CUDA_VISIBLE_DEVICES=1,2,3 LAYER1_JUDGE_ENABLED=0 \
+#   python -m pipelinerl.launch --config-name layer1_rl \
+#     output_dir=results/layer1_smoke \
+#     finetune.rl.kl_coef=0 world.preprocessor_fraction=0 \
+#     world.actor_fraction=2 world.finetune_fraction=1 \
+#     finetune.interrupt_train_steps=5 finetune.save_checkpoint_steps=5
+# ---------------------------------------------------------------------------
+defaults:
+  - base
+  - _self_
+
+# SFT-50K checkpoint: RL init AND KL reference.
+# Local patched copy: symlinked weights + tokenizer_config.json fixed
+# (extra_special_tokens list->{} for transformers 4.51.1 compat).
+model_path: /home/aiscuser/models/layer1_sft50k_patched
+model_revision: main
+
+eval_every_n_versions: 12800
+
+finetune:
+  attempts: 8
+  train_batch_size: 4
+  valid_batch_size: 4
+  gradient_accumulation_passes: 16
+  seq_length: 20000
+  seq_parallel: 1
+  learning_rate: 1.0e-6
+  lr_scheduler_type: cosine
+  num_warmup_steps: 10
+  max_train_steps: 500
+  save_checkpoint_steps: 50
+  rl:
+    kl_coef: 0.02
+    final_kl_coef: 0.02
+    entropy_bonus: 0.0001
+    overlong_filtering: false
+
+llm:
+  parameters:
+    max_tokens: 8192
+    temperature: 0.8
+  reasoning_delimiters: ["</think>"]
+  wandb_table:
+    enabled: true
+    keep_last_k_groups: 32
+    log_every_n_groups: 32
+
+test_llm:
+  parameters:
+    max_tokens: 8192
+    temperature: 0.8
+    top_p: 0.95
+    top_k: 20
+
+# ---- actor: in-process Layer1 rollout policy ----
+actor:
+  llm_max_rollouts: 16
+  max_retries: 10
+  rollout_policy: pipelinerl.domains.layer1.generate_layer1_rollout
+  # The SFT prompt (system+user) is carried per-record by the dataset loader,
+  # so no system_prompt / task_template is used by the rollout.
+  system_prompt: null
+  discount_factor: 1
+
+# No grader vLLM: the M2 judge is a direct Azure call inside the rollout.
+environment: null
+# Skip the built-in vLLM grader launch entirely (local=false short-circuits it
+# in launch.start_llm_grader); our judge is a direct Azure call.
+llm_grader:
+  local: false
+  name: null
+
+# ---- dataset: local SFT-chat JSONL -> pipelinerl problems ----
+dataset_loader: pipelinerl.domains.layer1.load_datasets
+dataset_loader_params:
+  seed: 42
+train_dataset_names:
+  # Length-filtered train set: 10 records > 11808-token rollout budget removed
+  # (kept 35615 / dropped 10, 0.028%). Those prompts deterministically return
+  # HTTP 400 under the 20000-8192 budget (e.g. 11914-tok prompt + 8192 completion
+  # = 20106 > 20000), which is what self-stopped the actor at step 122. Original
+  # train.jsonl preserved alongside.
+  - path: /scratch/azureml/cr/j/65fcf9508e03476381b75ace1f02fb73/cap/data-capability/wd/INPUT_msndni/shares/users/yuhangbai/MAIDistillation0623/rl_data/v2/train.lenfiltered.jsonl
+    name: layer1_delta_v2_passa
+# Eval is effectively disabled for this run (eval_every_n_versions huge +
+# +skip_first_eval=true at launch); keep the small smoke set as the nominal test.
+# Use the length-filtered smoke set (2 prompts > 11808-token rollout budget removed:
+# idx 145=18020 tok, idx 167=61450 tok). Those prompts can only ever return HTTP 400
+# under the 20000-8192 budget, so dropping them changes no eval metric (they never
+# produced an output to score) and prevents an eval-triggered actor crash.
+test_dataset_names:
+  - path: /scratch/azureml/cr/j/65fcf9508e03476381b75ace1f02fb73/cap/data-capability/wd/INPUT_msndni/shares/users/yuhangbai/MAIDistillation0623/rl/data_cleaning/_smoke/train.lenfiltered.jsonl
+    name: layer1_delta_smoke
+
+# ---- Stage-4 fused reward (consumed by build_config in domains/layer1/reward.py) ----
+reward:
+  stage: 4
+  w_rule: 0.1
+  w_llm: 0.9
+  rule_weights:
+    anti_collapse: 0.5
+    anti_hallucination: 0.4
+    fidelity: 0.1
+  llm_weights:
+    utility: 0.5
+    precision: 0.5
+    recall: 0.0   # opt-in interest-coverage reward; >0 only with LAYER1_RECALL_ENABLED=1
+  gate:
+    mode: soft
+    soft_value: 0.1
+  fidelity:
+    coverage_floor: 0.3
+    min_action_chars: 3
+  anti_collapse:
+    combine: mean
+    count:
+      tol_under: 2.0
+      tol_over: 2.0
+      scale_under: 1.4
+      scale_over: 1.2
+      floor: 0.4
+    length:
+      tol_under: 2.0
+      tol_over: 2.0
+      scale_under: 1.4
+      scale_over: 1.0
+      floor: 0.4
+  utility_scale: 10.0
+  precision_scale: 10.0
+
+vllm_config:
+  use_v1: false
+  vllm_kwargs:
+    dtype: bfloat16
+    gpu-memory-utilization: 0.9
+    num-scheduler-steps: 1
+    disable-log-requests: ""
+    disable-frontend-multiprocessing: ""
+    max-num-seqs: ${actor.llm_max_rollouts}
+    max-num-batched-tokens: 8192
+    max-model-len: ${finetune.seq_length}
+    enable-chunked-prefill: ""
+    return-tokens-as-token-ids: ""
+    tensor-parallel-size: 1
+    pipeline-parallel-size: 1
+    generation-config: vllm
+
+# ---- single node, 7 free GPUs: 3 actor + 1 preprocessor(ref/KL) + 3 finetune ----
+# NOTE: finetune needs >=3 GPUs here. With seq_length=20000 and DeepSpeed Stage-3,
+# 2 finetune GPUs OOM'd on a ~19.6k-token micro-batch (GPU hit ~81GB > 79GB cap).
+# 3 finetune GPUs shards optimizer/grad/params enough to leave activation headroom.
+world:
+  replicas: 1
+  actor_fraction: 3
+  preprocessor_fraction: 1
+  finetune_fraction: 3
+  env_replicas: 0
+  actor_group_port: 9000
+  # base 8080 collides with the system Jupyter server on this node; shift up.
+  actor_llm_start_port: 8180
+  environment_start_port: 7777
+
+wandb:
+  use_wandb: true
+  wandb_project_name: layer1-delta-rl
+  wandb_name: qwen3-4b-l1d-rl-stage4-wrule01

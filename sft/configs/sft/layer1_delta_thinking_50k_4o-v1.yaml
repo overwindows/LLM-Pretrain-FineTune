@@ -1,0 +1,68 @@
+# SFT config for layer1_delta — GPT-4o teacher, Thinking variant — 50K v1
+# 2026-05-25: scale-up from 10K → 50K curation data (wuc batch).
+#
+# Layer1_delta has the LONGEST outputs in the pipeline (delta = topical user
+# behavior summary, often multi-paragraph + per-signal change list). Prior
+# 10K run used the INSTRUCT variant of Qwen3-4B + max_seq=8192 and saw p99
+# ≈ 9.3k tokens (a few truncations). 50K thinking variant has even longer
+# total seq due to the <think> reasoning span.
+#
+# Tokenizer measurement (3000-record subset, Qwen3-4B-Thinking-2507):
+#   max_seq=8192   → 91.7% coverage
+#   max_seq=12288  → 98.8% coverage
+#   max_seq=14336  → 99.57% coverage   ← chosen
+#   max_seq=16384  → 99.92% coverage
+# Records exceeding max_seq_len are left-truncated by sft_train.py (keeping
+# assistant target intact); skipped if target itself is cut off.
+
+step_key: layer1_delta_thinking_50k
+
+# Base model — same Qwen3-4B-Thinking as layer0 (thinking variant of the family)
+base_model: /scratch/azureml/cr/j/fc096b74f20c46ae94d7fab7e20c1aa4/exe/wd/Models_local/Qwen3-4B-Thinking-2507
+
+# Data
+train_jsonl: /scratch/azureml/cr/j/fc096b74f20c46ae94d7fab7e20c1aa4/cap/data-capability/wd/INPUT_msndni/shares/users/yuhangbai/MAIProfileSFT_50k/data/splits/layer1_delta_thinking_50k_4o/train.jsonl
+val_jsonl:   /scratch/azureml/cr/j/fc096b74f20c46ae94d7fab7e20c1aa4/cap/data-capability/wd/INPUT_msndni/shares/users/yuhangbai/MAIProfileSFT_50k/data/splits/layer1_delta_thinking_50k_4o/val.jsonl
+
+# Output — local fast SSD; rsync to persistent post-run
+output_dir: /scratch/azureml/cr/j/fc096b74f20c46ae94d7fab7e20c1aa4/exe/wd/MAIProfileSFT_local_runs/layer1_delta_thinking_50k_4o-v1
+
+# Hyperparameters — longer max_seq_len, smaller per-GPU batch
+max_seq_len: 14336                 # 99.57% coverage on Qwen3-4B-Thinking tokenizer
+per_device_train_batch_size: 1
+per_device_eval_batch_size:  1
+gradient_accumulation_steps: 4     # 8 GPU * 1 * 4 = effective batch 32 (matches layer0)
+num_train_epochs: 2
+learning_rate: 5.0e-6
+weight_decay: 0.0
+warmup_ratio: 0.03
+lr_scheduler_type: cosine
+seed: 42
+
+# Match the layer0 winner (no think masking)
+mask_think_in_loss: false
+
+logging_steps: 10
+eval_strategy: steps
+eval_steps: 200
+save_strategy: steps
+save_steps: 200
+save_total_limit: 3
+
+gradient_checkpointing: true
+attn_implementation: sdpa          # flash-attn 2.8.3 ABI mismatch; SDPA works
+
+deepspeed_config: /scratch/azureml/cr/j/fc096b74f20c46ae94d7fab7e20c1aa4/cap/data-capability/wd/INPUT_msndni/shares/users/yuhangbai/MAIProfileSFT_50k/configs/deepspeed/ds_config_zero3.json
+
+resume_from_checkpoint: auto
+
+wandb_project: maiprofile-sft
+wandb_run_name: layer1_delta_thinking_50k_4o-v1
+wandb_tags:
+  - layer1_delta
+  - sft
+  - qwen3-4b-thinking
+  - gpt4o-teacher
+  - a100
+  - 50k
+  - no-mask-think

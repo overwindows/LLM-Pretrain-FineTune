@@ -1,0 +1,20 @@
+   Copyright 2024 ServiceNow, Inc.
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+     http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+--------------------------------------------------------------------------------
+This directory (rl/qed-nano/) contains a vendored copy of QED-Nano's `training/`
+tree (https://github.com/CMU-AIRe/QED-Nano @ commit 02a4699), redistributed under
+the Apache License 2.0 (see LICENSE). It has been MODIFIED by the EasyPosttrain
+authors. Changed files carry a "NOTICE: Modified from QED-Nano" header; a new
+task package `pipelinerl/domains/layer1/` was added. See UPSTREAM.md (repo root
+and rl/) for the full list of changes and reproduction notes.

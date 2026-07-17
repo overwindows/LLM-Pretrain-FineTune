@@ -1,0 +1,50 @@
+step_key: layer1_delta_thinking_50k_4o-v1
+data:
+  layer_format: layer1_delta
+# 1k validation subset (rebuilt seed=42, n=1000 from the 4531-line test set)
+test_jsonl: /scratch/azureml/cr/j/65fcf9508e03476381b75ace1f02fb73/exe/wd/l1d_eval/data/splits/layer1_delta_thinking_50k_4o/test_1k.jsonl
+predictions_dir: /scratch/azureml/cr/j/65fcf9508e03476381b75ace1f02fb73/exe/wd/l1d_eval/eval_results/predictions
+m1_dir: /scratch/azureml/cr/j/65fcf9508e03476381b75ace1f02fb73/exe/wd/l1d_eval/eval_results/m1
+m2_dir: /scratch/azureml/cr/j/65fcf9508e03476381b75ace1f02fb73/exe/wd/l1d_eval/eval_results/m2_judge
+recall_dir: /scratch/azureml/cr/j/65fcf9508e03476381b75ace1f02fb73/exe/wd/l1d_eval/eval_results/m2_recall
+report_path: /scratch/azureml/cr/j/65fcf9508e03476381b75ace1f02fb73/exe/wd/l1d_eval/eval_results/REPORT.md
+subject_models:
+  sft:
+    # top-level merged best checkpoint (== checkpoint-2260, best by eval_loss 0.0833)
+    model_path: /scratch/azureml/cr/j/65fcf9508e03476381b75ace1f02fb73/cap/data-capability/wd/INPUT_msndni/shares/users/yuhangbai/MAIProfileSFT_50k/checkpoints/layer1_delta_thinking_50k_4o-v1
+    served_name: qwen3-4b-thinking-sft-layer1delta-50k-4o-v1
+  rl:
+    model_path: /scratch/azureml/cr/j/65fcf9508e03476381b75ace1f02fb73/cap/data-capability/wd/INPUT_msndni/shares/users/yuhangbai/MAIProfileSFT_runs/qwen3-4b-l1d-rl-stage5
+    served_name: qwen3-4b-thinking-rl-l1d-stage5
+  rl_repro:
+    # this-machine repro: QED-Nano pipelinerl Stage-4 fused-reward RL, step 500/500
+    model_path: /home/aiscuser/QED-Nano/training/results/layer1_stage4/finetune/current
+    served_name: qwen3-4b-thinking-rl-l1d-stage4-repro
+  zero_shot:
+    model_path: /scratch/azureml/cr/j/65fcf9508e03476381b75ace1f02fb73/cap/data-capability/wd/INPUT_msndni/shares/users/yuhangbai/Models_local/Qwen3-4B-Thinking-2507
+    served_name: qwen3-4b-thinking-base
+vllm:
+  port: 8000
+  max_model_len: 40960
+  gpu_memory_utilization: 0.9
+  dtype: bfloat16
+  no_prefix_cache: true
+generation:
+  temperature: 0.2
+  top_p: 1.0
+  max_tokens: 8192
+  enable_thinking: true
+  concurrency: 64
+judge:
+  azure_endpoint: https://msncompanioneu2.cognitiveservices.azure.com/
+  api_version: 2024-12-01-preview
+  deployment: gpt-5.1
+  model_name: gpt-5.1
+  reasoning_effort: none
+  max_completion_tokens: 16000
+  concurrency: 32
+thresholds:
+  json_parse_rate_min: 0.98
+  schema_rate_min: 0.95
+  interest_match_f1_min: 0.6
+  evidence_fidelity_min: 0.95

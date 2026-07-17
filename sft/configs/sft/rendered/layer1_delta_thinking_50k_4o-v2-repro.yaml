@@ -1,0 +1,57 @@
+# SFT reproduction config (TEMPLATE) — layer1_delta, GPT-4o teacher, Thinking 50K.
+#
+# This is a PORTABLE template. Absolute paths are injected at launch time by
+# scripts/launch_repro_sft.sh via `envsubst`, so this file stays job-id agnostic
+# (the original v1 config hardcoded the now-dead job id fc096b74...).
+#
+# Hyperparameters are IDENTICAL to the recovered original run
+# (configs/sft/layer1_delta_thinking_50k_4o-v1.yaml), verified against the best
+# checkpoint's trainer_state.json: epoch=2.0, global_step=2260, best
+# eval_loss=0.0833 (checkpoint-2260). 2 epochs is the intended/confirmed recipe.
+
+step_key: layer1_delta_thinking_50k
+
+# --- Paths (rendered by launch script) ---
+base_model: /scratch/azureml/cr/j/65fcf9508e03476381b75ace1f02fb73/cap/data-capability/wd/INPUT_msndni/shares/users/yuhangbai/MAIDistillation0623/models/base/Qwen3-4B-Thinking-2507
+train_jsonl: /scratch/azureml/cr/j/65fcf9508e03476381b75ace1f02fb73/cap/data-capability/wd/INPUT_msndni/shares/users/yuhangbai/MAIDistillation0623/../MAIProfileSFT_50k/data/splits/layer1_delta_thinking_50k_4o/train.jsonl
+val_jsonl: /scratch/azureml/cr/j/65fcf9508e03476381b75ace1f02fb73/cap/data-capability/wd/INPUT_msndni/shares/users/yuhangbai/MAIDistillation0623/../MAIProfileSFT_50k/data/splits/layer1_delta_thinking_50k_4o/val.jsonl
+output_dir: /scratch/local_sft_runs/layer1_delta_thinking_50k_4o-v2-repro
+deepspeed_config: /scratch/azureml/cr/j/65fcf9508e03476381b75ace1f02fb73/cap/data-capability/wd/INPUT_msndni/shares/users/yuhangbai/MAIDistillation0623/sft/configs/deepspeed/ds_config_zero3.json
+
+# --- Hyperparameters (frozen — match the original recovered run) ---
+max_seq_len: 14336                 # 99.57% coverage on Qwen3-4B-Thinking tokenizer
+per_device_train_batch_size: 1
+per_device_eval_batch_size:  1
+gradient_accumulation_steps: 4     # 8 GPU * 1 * 4 = effective batch 32
+num_train_epochs: 2                # CONFIRMED: original run trained 2 epochs (not 3)
+learning_rate: 5.0e-6
+weight_decay: 0.0
+warmup_ratio: 0.03
+lr_scheduler_type: cosine
+seed: 42
+
+mask_think_in_loss: false          # no think masking (matches layer0 winner)
+
+logging_steps: 10
+eval_strategy: steps
+eval_steps: 200
+save_strategy: steps
+save_steps: 200
+save_total_limit: 3
+
+gradient_checkpointing: true
+attn_implementation: sdpa          # flash-attn 2.8.3 ABI mismatch; SDPA works
+
+resume_from_checkpoint: auto
+
+wandb_project: maiprofile-sft
+wandb_run_name: layer1_delta_thinking_50k_4o-v2-repro
+wandb_tags:
+  - layer1_delta
+  - sft
+  - qwen3-4b-thinking
+  - gpt4o-teacher
+  - a100
+  - 50k
+  - no-mask-think
+  - repro
