@@ -418,7 +418,12 @@ def main():
 
     # --- Tokenizer ---
     logger.info("Loading tokenizer: %s", cfg.base_model)
-    tokenizer = AutoTokenizer.from_pretrained(cfg.base_model, trust_remote_code=True)
+    # use_fast=False: the ptca AML conda env has tokenizers 0.19.x (Python 3.8 ceiling).
+    # Qwen3's tokenizer.json uses the ModelWrapper format introduced in tokenizers>=0.20.0,
+    # so fast tokenizer loading always fails with "data did not match any variant of
+    # untagged enum ModelWrapper". The slow tokenizer is pure-Python, reads vocab/merges
+    # files directly, and has no version dependency on the Rust tokenizers extension.
+    tokenizer = AutoTokenizer.from_pretrained(cfg.base_model, trust_remote_code=True, use_fast=False)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
