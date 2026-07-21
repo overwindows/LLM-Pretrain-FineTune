@@ -65,8 +65,11 @@ if [ "$PTCA_PYMINOR" -ge 9 ]; then
   echo "[env] Step 1c: deepspeed (DS_BUILD_OPS=0 = no CUDA compile, uses JIT)"
   DS_BUILD_OPS=0 $PTCA_PIP install --user --ignore-requires-python 'deepspeed'
 
-  echo "[env] Step 1d: datasets + peft"
-  $PTCA_PIP install --user --ignore-requires-python 'datasets' 'peft'
+  echo "[env] Step 1d: datasets + peft (pin pandas<3 to avoid Python 3.11 requirement)"
+  $PTCA_PIP install --user --ignore-requires-python \
+      'pandas<3.0' \
+      'datasets<3.0' \
+      'peft'
 
   echo "[env] Step 2/2: verify"
   $PTCA_PY -c "
