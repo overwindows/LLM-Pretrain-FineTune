@@ -258,10 +258,22 @@ def build_dataset(
     max_seq_len: int,
     debug_subsample: int | None = None,
     mask_think_in_loss: bool = False,
+    num_proc: int | None = None,
 ) -> Dataset:
+    """Build a tokenized HuggingFace Dataset from a JSONL file.
+
+    Tokenization runs via ``Dataset.map(num_proc=N)`` — each record is
+    processed in a separate worker process, bypassing the GIL and using all
+    available CPU cores.  This replaces the old single-threaded for-loop which
+    took 20–40 min on 50k × 14336-token records with the slow tokenizer.
+
+    ``num_proc`` defaults to ``os.cpu_count()`` (all cores).  Pass 1 to
+    reproduce the old single-process behaviour (useful for debugging).
+    """
     records = load_jsonl(jsonl_path)
     if debug_subsample:
         records = records[:debug_subsample]
+
     think_close_ids: list[int] = []
     if mask_think_in_loss:
         think_close_ids = find_think_close_token_ids(tokenizer)
@@ -273,43 +285,59 @@ def build_dataset(
                 "tokenizer does not recognise '</think>' string; think masking "
                 "will be a no-op for every record"
             )
-    tokenized: list[dict[str, Any]] = []
-    n_skip_no_asst = 0
-    n_skip_truncated_target = 0
-    n_overlong = 0
-    n_think_masked = 0
-    n_no_think_in_span = 0
-    for rec in records:
-        msgs = rec.get("messages", [])
-        if len(msgs) < 2 or msgs[-1].get("role") != "assistant":
-            n_skip_no_asst += 1
-            continue
-        out = tokenize_record(
+
+    raw_ds = Dataset.from_list(records)
+
+    # Bind tokenizer + hyperparams into the map fn.  Each worker process gets
+    # its own copy via pickle — safe with use_fast=False (pure-Python tokenizer).
+    _SKIP = {"input_ids": [], "attention_mask": [], "labels": []}
+
+    def _map_fn(rec):
+        # tokenize_record returns None when the record should be skipped.
+        # dataset.map requires consistent output columns across all rows, so
+        # we return empty lists instead of None; the filter step removes them.
+        result = tokenize_record(
             rec,
             tokenizer,
             max_seq_len,
             mask_think_in_loss=mask_think_in_loss,
             think_close_ids=think_close_ids,
         )
-        if out is None:
-            n_skip_truncated_target += 1
-            continue
-        if len(out["input_ids"]) == max_seq_len:
-            n_overlong += 1
-        if mask_think_in_loss and think_close_ids:
-            # Count whether the record actually had its think span masked
-            if "<think>" in msgs[-1].get("content", ""):
-                n_think_masked += 1
-            else:
-                n_no_think_in_span += 1
-        tokenized.append(out)
+        return result if result is not None else _SKIP
+
+    n_workers = num_proc if num_proc is not None else os.cpu_count()
     logger.info(
-        "build_dataset(%s): kept=%d skip_no_asst=%d skip_truncated_target=%d "
-        "overlong=%d think_masked=%d no_think_in_span=%d",
-        jsonl_path, len(tokenized), n_skip_no_asst, n_skip_truncated_target,
-        n_overlong, n_think_masked, n_no_think_in_span,
+        "build_dataset(%s): tokenizing %d records with num_proc=%d ...",
+        jsonl_path, len(records), n_workers,
     )
-    return Dataset.from_list(tokenized)
+
+    tokenized_ds = raw_ds.map(
+        _map_fn,
+        num_proc=n_workers,
+        remove_columns=raw_ds.column_names,
+        desc=f"Tokenizing {os.path.basename(jsonl_path)}",
+        # Keep only records where input_ids was produced (skip → empty dict)
+        load_from_cache_file=False,
+    )
+
+    # Filter out skipped records (empty lists from _SKIP sentinel)
+    tokenized_ds = tokenized_ds.filter(
+        lambda x: len(x["input_ids"]) > 0,
+        num_proc=n_workers,
+        desc="Filtering skipped",
+    )
+
+    # Compute stats for logging
+    n_kept = len(tokenized_ds)
+    n_total = len(records)
+    n_skipped = n_total - n_kept
+    n_overlong = sum(1 for ids in tokenized_ds["input_ids"] if len(ids) == max_seq_len)
+
+    logger.info(
+        "build_dataset(%s): kept=%d skipped=%d overlong=%d",
+        jsonl_path, n_kept, n_skipped, n_overlong,
+    )
+    return tokenized_ds
 
 
 # ---------------------------------------------------------------------------
