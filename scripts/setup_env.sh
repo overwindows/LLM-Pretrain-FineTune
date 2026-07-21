@@ -56,13 +56,17 @@ if [ "$PTCA_PYMINOR" -ge 9 ]; then
   # =====================================================================
   echo "[env] Python $PTCA_PYVER: normal install (tokenizers 0.21.x available)"
 
-  echo "[env] Step 1/2: transformers==4.51.3 + deps"
-  $PTCA_PIP install --user --ignore-requires-python \
-      'transformers==4.51.3' \
-      'accelerate' \
-      'deepspeed' \
-      'datasets' 'peft' \
-      2>&1 | tail -8
+  echo "[env] Step 1a: transformers==4.51.3"
+  $PTCA_PIP install --user --ignore-requires-python 'transformers==4.51.3'
+
+  echo "[env] Step 1b: accelerate"
+  $PTCA_PIP install --user --ignore-requires-python 'accelerate'
+
+  echo "[env] Step 1c: deepspeed (DS_BUILD_OPS=0 = no CUDA compile, uses JIT)"
+  DS_BUILD_OPS=0 $PTCA_PIP install --user --ignore-requires-python 'deepspeed'
+
+  echo "[env] Step 1d: datasets + peft"
+  $PTCA_PIP install --user --ignore-requires-python 'datasets' 'peft'
 
   echo "[env] Step 2/2: verify"
   $PTCA_PY -c "
