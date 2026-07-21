@@ -33,13 +33,13 @@ if [ "$SKIP_IF_OK" = "1" ]; then
 import sys
 sys.path.insert(0, '$USER_SITE')
 try:
-    import transformers
+    import transformers, accelerate
     print(transformers.__version__)
 except Exception:
     print('missing')
 " 2>/dev/null)
   if [ "$TV" = "4.51.3" ]; then
-    echo "  transformers 4.51.3 already installed — skipping"
+    echo "  transformers 4.51.3 + accelerate already installed — skipping"
     export PYTHONPATH=$USER_SITE:${PYTHONPATH:-}
     exit 0
   fi
@@ -59,17 +59,20 @@ if [ "$PTCA_PYMINOR" -ge 9 ]; then
   echo "[env] Step 1/2: transformers==4.51.3 + deps"
   $PTCA_PIP install --user --ignore-requires-python \
       'transformers==4.51.3' \
+      'accelerate' \
+      'deepspeed' \
       'datasets' 'peft' \
-      2>&1 | tail -5
+      2>&1 | tail -8
 
   echo "[env] Step 2/2: verify"
   $PTCA_PY -c "
 import sys
 sys.path.insert(0, '$USER_SITE')
-import transformers, datasets, peft
+import transformers, datasets, peft, accelerate
 v = transformers.__version__
 assert v == '4.51.3', f'FATAL: transformers {v}'
 print('  transformers', v)
+print('  accelerate  ', accelerate.__version__)
 print('  datasets    ', datasets.__version__)
 print('  peft        ', peft.__version__)
 print('  OK')

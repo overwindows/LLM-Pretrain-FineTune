@@ -178,5 +178,17 @@ def conda_python(conda_env: str) -> str:
 
 
 def conda_bin(conda_env: str, binary: str) -> str:
-    """Return path to a binary in the given conda environment's bin/."""
+    """Return path to a binary in the given conda environment's bin/.
+
+    Also checks $PYTHONUSERBASE/bin/ first so that binaries installed via
+    ``pip install --user`` (e.g. accelerate installed into /tmp/ptca_user)
+    are found before falling back to the conda env.
+    """
+    # Check user-base bin first (set by setup_env.sh)
+    user_base = os.environ.get("PYTHONUSERBASE", "")
+    if user_base:
+        user_bin = os.path.join(user_base, "bin", binary)
+        if os.path.isfile(user_bin):
+            logger.debug("conda_bin: using user-installed %s at %s", binary, user_bin)
+            return user_bin
     return f"{_conda_env_root(conda_env)}/bin/{binary}"
