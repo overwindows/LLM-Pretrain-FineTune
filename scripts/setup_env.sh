@@ -71,6 +71,9 @@ if [ "$PTCA_PYMINOR" -ge 9 ]; then
       'datasets<3.0' \
       'peft'
 
+  echo "[env] Step 1e: wandb (required by HF Trainer WandbCallback)"
+  $PTCA_PIP install --user --ignore-requires-python 'wandb'
+
   echo "[env] Step 2/2: verify"
   $PTCA_PY -c "
 import sys
@@ -163,6 +166,9 @@ print('  OK')
 
   echo "[env] Step 5/5: datasets + peft"
   $PTCA_PIP install --user --only-binary :all: --ignore-requires-python datasets peft 2>&1 | tail -3
+
+  echo "[env] Step 6/6: wandb (required by HF Trainer WandbCallback)"
+  $PTCA_PIP install --user --ignore-requires-python 'wandb' 2>&1 | tail -3
 
 fi
 
