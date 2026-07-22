@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import deepspeed.runtime.lr_schedules  # noqa: F401 -- force submodule import before accelerate touches deepspeed.runtime
 import torch
 
 # Compat: PyTorch 2.6+ made `weights_only=True` the default for torch.load,
