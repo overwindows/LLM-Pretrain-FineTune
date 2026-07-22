@@ -305,9 +305,12 @@ def build_dataset(
         )
         return result if result is not None else _SKIP
 
-    n_workers = num_proc if num_proc is not None else min(8, os.cpu_count() or 8)
+    # OOM FIX: each of the 8 DDP ranks calls build_dataset() simultaneously.
+    # With num_proc=N each rank spawns N subprocesses => 8*N total forks.
+    # Even N=8 caused OOM (64 forks). Force num_proc=1 (in-process, no fork).
+    n_workers = 1  # was: num_proc if num_proc is not None else min(8, ...)
     logger.info(
-        "build_dataset(%s): tokenizing %d records with num_proc=%d ...",
+        "[SFT] Tokenizing %s (%d records) num_proc=%d (forced=1 to prevent multi-rank OOM)",
         jsonl_path, len(records), n_workers,
     )
 
@@ -317,7 +320,7 @@ def build_dataset(
         remove_columns=raw_ds.column_names,
         desc=f"Tokenizing {os.path.basename(jsonl_path)}",
         # Keep only records where input_ids was produced (skip → empty dict)
-        load_from_cache_file=False,
+        load_from_cache_file=True,  # allow cache; forced num_proc=1 eliminates OOM
     )
 
     # Filter out skipped records (empty lists from _SKIP sentinel)
