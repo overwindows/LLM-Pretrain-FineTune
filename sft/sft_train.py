@@ -305,7 +305,7 @@ def build_dataset(
         )
         return result if result is not None else _SKIP
 
-    n_workers = num_proc if num_proc is not None else os.cpu_count()
+    n_workers = num_proc if num_proc is not None else min(8, os.cpu_count() or 8)
     logger.info(
         "build_dataset(%s): tokenizing %d records with num_proc=%d ...",
         jsonl_path, len(records), n_workers,
