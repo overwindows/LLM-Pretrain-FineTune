@@ -439,12 +439,22 @@ def main():
 
     # --- WandB ---
     if cfg.wandb_project and not args.smoke_test and not args.debug and not args.no_wandb:
-        os.environ.setdefault("WANDB_PROJECT", cfg.wandb_project)
-        if cfg.wandb_run_name:
-            os.environ.setdefault("WANDB_NAME", cfg.wandb_run_name)
-        if cfg.wandb_tags:
-            os.environ.setdefault("WANDB_TAGS", ",".join(cfg.wandb_tags))
-        report_to = ["wandb"]
+        # Only enable W&B if an API key is available — avoids a fatal
+        # UsageError crash on AML nodes where the key wasn't forwarded.
+        if os.environ.get("WANDB_API_KEY"):
+            os.environ.setdefault("WANDB_PROJECT", cfg.wandb_project)
+            if cfg.wandb_run_name:
+                os.environ.setdefault("WANDB_NAME", cfg.wandb_run_name)
+            if cfg.wandb_tags:
+                os.environ.setdefault("WANDB_TAGS", ",".join(cfg.wandb_tags))
+            report_to = ["wandb"]
+        else:
+            logger.warning(
+                "WANDB_API_KEY not set — disabling W&B logging (report_to=none). "
+                "Set WANDB_API_KEY in your secrets file or AML job env vars to enable."
+            )
+            os.environ["WANDB_DISABLED"] = "true"
+            report_to = ["none"]
     else:
         report_to = ["none"]
 
