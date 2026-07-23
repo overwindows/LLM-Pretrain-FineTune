@@ -19,7 +19,7 @@ output_dir: ${OUTPUT_DIR}
 deepspeed_config: ${DEEPSPEED_CONFIG}
 
 # --- Hyperparameters (frozen — match the original recovered run) ---
-max_seq_len: 14336                 # 99.57% coverage on Qwen3-4B-Thinking tokenizer
+max_seq_len: 8192                  # reduced from 14336 for single-GPU A100 80GB fit
 per_device_train_batch_size: 1
 per_device_eval_batch_size:  1
 gradient_accumulation_steps: 4     # 8 GPU * 1 * 4 = effective batch 32
