@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import string
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -71,10 +72,14 @@ class SFTStage:
 
         rendered_config = self._render_config()
 
+        # Do NOT pass cuda_visible_devices here — let AML infrastructure control
+        # CUDA_VISIBLE_DEVICES.  Passing an explicit list caused
+        # "CUDA error: invalid device ordinal" when the node exposes fewer GPUs
+        # than the hardcoded list (e.g. 1 GPU node getting devices 0..7).
         env_overlay = setup_training_env(
             secrets_file=self.cfg.get("secrets_file", "~/.secrets/maiprofile_sft.env"),
             strip_aml_mpi=True,
-            cuda_visible_devices=self._cuda_visible_devices(),
+            cuda_visible_devices=None,
         )
         env_overlay["WANDB_PROJECT"] = self.cfg.get("wandb_project", "maiprofile-sft")
         env_overlay["WANDB_NAME"] = self.run_name
@@ -85,10 +90,15 @@ class SFTStage:
         accel_config = str(self._repo_root / self.cfg["accelerate_config"])
         sft_script = str(self._easytrain_sft / "sft_train.py")
 
+        # Detect actual GPU count at runtime so --num_processes matches reality.
+        num_processes = self._actual_gpu_count()
+        logger.info("[SFT] Detected %d GPU(s); launching %d accelerate process(es).",
+                    num_processes, num_processes)
+
         cmd = [
             accelerate, "launch",
             "--config_file", accel_config,
-            "--num_processes", str(self.cfg.get("num_gpus", 8)),
+            "--num_processes", str(num_processes),
             sft_script,
             "--config", rendered_config,
         ]
@@ -134,9 +144,38 @@ class SFTStage:
         logger.info("Rendered SFT config -> %s", rendered_path)
         return rendered_path
 
-    def _cuda_visible_devices(self) -> str:
-        n = self.cfg.get("num_gpus", 8)
-        return ",".join(str(i) for i in range(n))
+    def _actual_gpu_count(self) -> int:
+        """Detect the number of CUDA-visible GPUs available on this node.
+
+        Priority:
+        1. CUDA_VISIBLE_DEVICES env var (already set by AML infrastructure).
+        2. nvidia-smi --list-gpus count.
+        3. Fall back to cfg["num_gpus"] (default 1 for safety).
+        """
+        cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+        if cvd and cvd not in ("NoDevFiles", "-1", ""):
+            count = len(cvd.split(","))
+            logger.info("[SFT] CUDA_VISIBLE_DEVICES=%r -> %d GPU(s)", cvd, count)
+            return count
+        # nvidia-smi fallback
+        try:
+            out = subprocess.check_output(
+                ["nvidia-smi", "--list-gpus"], text=True, timeout=10,
+            )
+            count = len([ln for ln in out.splitlines() if ln.strip()])
+            if count > 0:
+                logger.info("[SFT] nvidia-smi detected %d GPU(s)", count)
+                return count
+        except Exception as exc:
+            logger.warning("[SFT] nvidia-smi failed (%s); using cfg num_gpus fallback", exc)
+        fallback = self.cfg.get("num_gpus", 1)
+        logger.info("[SFT] GPU count fallback from cfg: %d", fallback)
+        return fallback
+
+    def _cuda_visible_devices(self) -> Optional[str]:
+        # Intentionally returns None — do NOT override AML's CUDA_VISIBLE_DEVICES.
+        # Kept for API compatibility; no longer called from run().
+        return None
 
     def _read_summary(self) -> SFTResult:
         summary_path = os.path.join(self.local_output_dir, "training_summary.json")
