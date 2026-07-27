@@ -41,6 +41,7 @@ save_total_limit: 3
 
 gradient_checkpointing: true
 attn_implementation: sdpa          # flash-attn 2.8.3 ABI mismatch; SDPA works
+load_best_model_at_end: false      # prevent DeepSpeed ZeRO3 OOM on checkpoint reload after training
 
 resume_from_checkpoint: auto
 
