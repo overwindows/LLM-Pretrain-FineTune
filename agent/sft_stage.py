@@ -103,7 +103,7 @@ class SFTStage:
             "--config", rendered_config,
         ]
         run_cmd(cmd, env=env, cwd=str(self._easytrain_sft), log_prefix="SFT")
-        rsync_to_cosmos(self.local_output_dir, self.cosmos_ckpt_dir)
+        # No rsync needed — checkpoints written directly to cosmos_ckpt_dir (RW_MOUNT).
 
         result = self._read_summary()
         logger.info(
@@ -130,7 +130,10 @@ class SFTStage:
             "BASE_MODEL": self.base_model,
             "TRAIN_JSONL": self.train_jsonl,
             "VAL_JSONL": self.val_jsonl,
-            "OUTPUT_DIR": self.local_output_dir,
+            # Write checkpoints directly to Cosmos (RW_MOUNT) so they survive
+            # job restarts.  resume_from_checkpoint: auto then finds them on
+            # the next run without any manual rsync.
+            "OUTPUT_DIR": self.cosmos_ckpt_dir,
             "DEEPSPEED_CONFIG": deepspeed_config,
         }
         rendered = string.Template(template).safe_substitute(vars_)
@@ -178,7 +181,7 @@ class SFTStage:
         return None
 
     def _read_summary(self) -> SFTResult:
-        summary_path = os.path.join(self.local_output_dir, "training_summary.json")
+        summary_path = os.path.join(self.cosmos_ckpt_dir, "training_summary.json")
         best_ckpt = eval_loss = global_step = None
         if os.path.isfile(summary_path):
             try:
