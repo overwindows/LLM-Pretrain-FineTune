@@ -12,9 +12,54 @@
 set -e
 
 SKIP_IF_OK=0
-for arg in "$@"; do
-  [ "$arg" = "--skip-if-ok" ] && SKIP_IF_OK=1
+PROFILE=legacy
+PYTHON_BIN=python3
+ENV_DIR=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --skip-if-ok) SKIP_IF_OK=1; shift ;;
+    --profile) PROFILE="${2:?--profile requires a value}"; shift 2 ;;
+    --python) PYTHON_BIN="${2:?--python requires an interpreter}"; shift 2 ;;
+    --env-dir) ENV_DIR="${2:?--env-dir requires a new venv path}"; shift 2 ;;
+    *) echo "Unknown setup option: $1" >&2; exit 2 ;;
+  esac
 done
+
+if [ "$PROFILE" = qwen35 ]; then
+  set -euo pipefail
+  : "${ENV_DIR:?qwen35 requires --env-dir pointing to a NEW isolated environment}"
+  unset PYTHONPATH PYTHONUSERBASE
+  export PYTHONNOUSERSITE=1
+  "$PYTHON_BIN" -c 'import sys; assert sys.version_info >= (3, 10), "Qwen3.5 requires Python >=3.10; do not patch version gates"'
+  if [ -e "$ENV_DIR" ] || [ -L "$ENV_DIR" ]; then
+    echo "Refusing to modify existing environment: $ENV_DIR" >&2
+    exit 2
+  fi
+  ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  "$PYTHON_BIN" -m venv "$ENV_DIR"
+  VENV_PY="$ENV_DIR/bin/python"
+  "$VENV_PY" -m pip install -r "$ROOT/env/qwen35-sft-requirements.txt"
+  "$VENV_PY" -m pip check
+  "$VENV_PY" - <<'PYEOF'
+import accelerate, datasets, torch, transformers
+from transformers import Qwen3_5Config, Qwen3_5ForConditionalGeneration
+print("transformers", transformers.__version__)
+print("torch", torch.__version__, "cuda", torch.version.cuda, "available", torch.cuda.is_available())
+print("accelerate", accelerate.__version__, "datasets", datasets.__version__)
+print("Qwen3.5 class", Qwen3_5ForConditionalGeneration.__name__)
+print("Dependency import check only: GPU training and serving readiness are NOT established.")
+PYEOF
+  "$VENV_PY" -m pip freeze > "$ENV_DIR/resolved-requirements.txt"
+  echo "Use $VENV_PY (or $ENV_DIR/bin/accelerate); do not run legacy setup in this venv."
+  exit 0
+elif [ "$PROFILE" != legacy ]; then
+  echo "Unsupported setup profile: $PROFILE" >&2
+  exit 2
+fi
+if [ -n "$ENV_DIR" ] || [ "$PYTHON_BIN" != python3 ]; then
+  echo "--env-dir and --python require --profile qwen35" >&2
+  exit 2
+fi
 
 PTCA_PIP=/opt/conda/envs/ptca/bin/pip
 PTCA_PY=/opt/conda/envs/ptca/bin/python

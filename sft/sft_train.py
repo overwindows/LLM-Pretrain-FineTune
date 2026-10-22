@@ -29,31 +29,54 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import deepspeed.runtime.lr_schedules  # noqa: F401 -- force submodule import before accelerate touches deepspeed.runtime
 import torch
 
-# Compat: PyTorch 2.6+ made `weights_only=True` the default for torch.load,
-# but DeepSpeed 0.15.4's torch_checkpoint_engine calls torch.load() without
-# specifying weights_only, breaking checkpoint reload (e.g. the
-# load_best_model_at_end=True path at end of Trainer.train()).
-# We trust checkpoints we wrote ourselves — restore prior default.
-_orig_torch_load = torch.load
-def _torch_load_compat(*args, **kwargs):
-    kwargs.setdefault("weights_only", False)
-    return _orig_torch_load(*args, **kwargs)
-torch.load = _torch_load_compat  # type: ignore[assignment]
-
 import yaml
+import transformers
 from datasets import Dataset
 from transformers import (
-    AutoModelForCausalLM,
+    AutoConfig,
     AutoTokenizer,
     Trainer,
     TrainingArguments,
     set_seed,
 )
 
+if __package__:
+    from .training_utils import (
+        configure_qwen35_text_training,
+        find_think_close_token_ids,
+        model_class_for_config,
+        tokenize_record,
+        validate_sample_weight,
+        warmup_arguments,
+    )
+else:
+    from training_utils import (
+        configure_qwen35_text_training,
+        find_think_close_token_ids,
+        model_class_for_config,
+        tokenize_record,
+        validate_sample_weight,
+        warmup_arguments,
+    )
+
 logger = logging.getLogger("sft_train")
+
+
+def setup_deepspeed() -> None:
+    import deepspeed
+    import deepspeed.runtime.lr_schedules  # noqa: F401
+
+    # Only the historical DS checkpoint engine needs the old torch.load default.
+    if deepspeed.__version__ == "0.15.4":
+        original_load = torch.load
+
+        def load_legacy_checkpoint(*args, **kwargs):
+            kwargs.setdefault("weights_only", False)
+            return original_load(*args, **kwargs)
+
+        torch.load = load_legacy_checkpoint
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +118,9 @@ class SFTConfig:
     # (the full assistant span still contributes — which for those records is
     # just the JSON answer).
     mask_think_in_loss: bool = False
+    # None preserves legacy defaults. Qwen3.5 requires an explicit policy.
+    enable_thinking: bool | None = None
+    model_revision: str | None = None
 
     @classmethod
     def from_yaml(cls, path: str) -> "SFTConfig":
@@ -111,146 +137,15 @@ class SFTConfig:
 def load_jsonl(path: str) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     with open(path) as f:
-        for line in f:
+        for line_number, line in enumerate(f, 1):
             line = line.strip()
             if not line:
                 continue
             try:
                 records.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSON in {path} at line {line_number}") from exc
     return records
-
-
-def _render_and_encode(
-    tokenizer,
-    messages: list[dict[str, str]],
-    add_generation_prompt: bool,
-) -> list[int]:
-    """Render the chat template to a string, then encode to int ids.
-
-    Works around transformers >= 5.x behaviour where
-    apply_chat_template(..., tokenize=True) returns a BatchEncoding wrapping
-    [Encoding(...)] (one element per message) instead of a flat int list.
-    """
-    text = tokenizer.apply_chat_template(
-        messages,
-        add_generation_prompt=add_generation_prompt,
-        tokenize=False,
-    )
-    return tokenizer(text, add_special_tokens=False)["input_ids"]
-
-
-def find_last_assistant_span(
-    tokenizer,
-    messages: list[dict[str, str]],
-    full_ids: list[int],
-) -> tuple[int, int]:
-    """Return (start, end) token indices of the last assistant message's tokens
-    in `full_ids` produced by render+encode of the full message list.
-
-    Strategy: render messages[:-1] with add_generation_prompt=True. The length
-    of that prefix is the start; end = len(full_ids).
-    """
-    prefix_messages = messages[:-1]
-    prefix_ids = _render_and_encode(tokenizer, prefix_messages, add_generation_prompt=True)
-    start = len(prefix_ids)
-    end = len(full_ids)
-    # sanity check: prefix should be a prefix of full_ids
-    if prefix_ids != full_ids[:start]:
-        # fall back: find longest matching prefix
-        for i in range(min(len(prefix_ids), len(full_ids)) - 1, 0, -1):
-            if prefix_ids[:i] == full_ids[:i]:
-                start = i
-                break
-    return start, end
-
-
-def find_think_close_token_ids(tokenizer) -> list[int]:
-    """Return the token ids for the literal string '</think>'. Qwen3 chat
-    template uses a single special-token id for this; other tokenizers may
-    split it into 2-3 sub-tokens.
-
-    Returns [] if the tokenizer does not recognise the string at all (in which
-    case think masking is a no-op for that base model).
-    """
-    ids = tokenizer.encode("</think>", add_special_tokens=False)
-    return ids if ids else []
-
-
-def find_subsequence(haystack: list[int], needle: list[int]) -> int:
-    """Return the FIRST index i such that haystack[i:i+len(needle)] == needle,
-    or -1 if not found."""
-    if not needle:
-        return -1
-    nlen = len(needle)
-    for i in range(len(haystack) - nlen + 1):
-        if haystack[i : i + nlen] == needle:
-            return i
-    return -1
-
-
-def tokenize_record(
-    rec: dict[str, Any],
-    tokenizer,
-    max_seq_len: int,
-    mask_think_in_loss: bool = False,
-    think_close_ids: list[int] | None = None,
-) -> dict[str, Any] | None:
-    """Returns {input_ids, attention_mask, labels} for one record.
-    Labels are -100 except on the last assistant message tokens.
-    Returns None if the record can't be used (no assistant message, truncated
-    away, etc.).
-
-    When `mask_think_in_loss=True` and the assistant span contains a closing
-    `</think>` token (id sequence provided in `think_close_ids`), label
-    positions from `start` up to and including the `</think>` token are also
-    set to -100. Only tokens AFTER `</think>` (the JSON answer) contribute to
-    the loss. If `</think>` is not present, the full assistant span trains.
-    """
-    messages = rec.get("messages", [])
-    if len(messages) < 2 or messages[-1].get("role") != "assistant":
-        return None
-
-    try:
-        full_ids = _render_and_encode(tokenizer, messages, add_generation_prompt=False)
-    except Exception as exc:
-        logger.warning("chat_template failed: %s", exc)
-        return None
-
-    if len(full_ids) > max_seq_len:
-        # Truncate from the LEFT, keeping the assistant target intact at the end.
-        full_ids = full_ids[-max_seq_len:]
-
-    start, end = find_last_assistant_span(tokenizer, messages, full_ids)
-    if end - start <= 0:
-        # After truncation, the assistant tokens may have been cut. Skip.
-        return None
-
-    input_ids = full_ids
-    attention_mask = [1] * len(input_ids)
-    labels = [-100] * len(input_ids)
-
-    train_start = start
-    if mask_think_in_loss and think_close_ids:
-        # Search for </think> only inside the assistant span
-        rel = find_subsequence(input_ids[start:end], think_close_ids)
-        if rel >= 0:
-            # Mask through the </think> tokens themselves; train starts after.
-            train_start = start + rel + len(think_close_ids)
-            if train_start >= end:
-                # </think> at the very end leaves nothing to train on; fall
-                # back to the safe behaviour of training the whole span.
-                train_start = start
-
-    for i in range(train_start, end):
-        labels[i] = input_ids[i]
-
-    return {
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "labels": labels,
-    }
 
 
 def build_dataset(
@@ -260,18 +155,20 @@ def build_dataset(
     debug_subsample: int | None = None,
     mask_think_in_loss: bool = False,
     num_proc: int | None = None,
+    enable_thinking: bool | None = None,
 ) -> Dataset:
     """Build a tokenized HuggingFace Dataset from a JSONL file.
 
-    Tokenization runs via ``Dataset.map(num_proc=N)`` — each record is
-    processed in a separate worker process, bypassing the GIL and using all
-    available CPU cores.  This replaces the old single-threaded for-loop which
-    took 20–40 min on 50k × 14336-token records with the slow tokenizer.
-
-    ``num_proc`` defaults to ``os.cpu_count()`` (all cores).  Pass 1 to
-    reproduce the old single-process behaviour (useful for debugging).
+    Tokenization stays in-process on each rank to avoid a per-rank worker
+    explosion. ``num_proc`` is retained for call compatibility, not used.
     """
     records = load_jsonl(jsonl_path)
+    if not records:
+        raise ValueError(f"Empty dataset: {jsonl_path}")
+    # Check all rows before subsampling or projecting away the raw columns.
+    for rec in records:
+        validate_sample_weight(rec)
+        rec.pop("sample_weight", None)
     if debug_subsample:
         records = records[:debug_subsample]
 
@@ -289,8 +186,6 @@ def build_dataset(
 
     raw_ds = Dataset.from_list(records)
 
-    # Bind tokenizer + hyperparams into the map fn.  Each worker process gets
-    # its own copy via pickle — safe with use_fast=False (pure-Python tokenizer).
     _SKIP = {"input_ids": [], "attention_mask": [], "labels": []}
 
     def _map_fn(rec):
@@ -303,16 +198,15 @@ def build_dataset(
             max_seq_len,
             mask_think_in_loss=mask_think_in_loss,
             think_close_ids=think_close_ids,
+            enable_thinking=enable_thinking,
         )
         return result if result is not None else _SKIP
 
-    # OOM FIX: each of the 8 DDP ranks calls build_dataset() simultaneously.
-    # With num_proc=N each rank spawns N subprocesses => 8*N total forks.
-    # Even N=8 caused OOM (64 forks). Force num_proc=1 (in-process, no fork).
-    n_workers = 1  # was: num_proc if num_proc is not None else min(8, ...)
+    # New datasets versions also spawn a worker for num_proc=1.
+    n_workers = None
     logger.info(
-        "[SFT] Tokenizing %s (%d records) num_proc=%d (forced=1 to prevent multi-rank OOM)",
-        jsonl_path, len(records), n_workers,
+        "[SFT] Tokenizing %s (%d records) in-process to prevent multi-rank OOM",
+        jsonl_path, len(records),
     )
 
     tokenized_ds = raw_ds.map(
@@ -321,7 +215,7 @@ def build_dataset(
         remove_columns=raw_ds.column_names,
         desc=f"Tokenizing {os.path.basename(jsonl_path)}",
         # Keep only records where input_ids was produced (skip → empty dict)
-        load_from_cache_file=True,  # allow cache; forced num_proc=1 eliminates OOM
+        load_from_cache_file=True,
     )
 
     # Filter out skipped records (empty lists from _SKIP sentinel)
@@ -357,6 +251,7 @@ class DataCollatorForSFT:
         attention_mask = []
         labels = []
         for f in features:
+            validate_sample_weight(f)
             pad_len = max_len - len(f["input_ids"])
             input_ids.append(f["input_ids"] + [self.pad_token_id] * pad_len)
             attention_mask.append(f["attention_mask"] + [0] * pad_len)
@@ -380,10 +275,8 @@ def compute_metrics(eval_pred):
     preds, labels = eval_pred
     # preds shape: (batch, seq_len) after preprocess_logits_for_metrics
     # labels shape: (batch, seq_len)
-    # Shift: model predicts token t+1 from position t, but Trainer already shifts
-    # labels internally for CE loss. For metrics we mirror: predictions[i] should
-    # match labels[i] where labels[i] != -100 (after the same shift).
-    # We approximate: ignore shift here (counts both sides), which is fine for trend.
+    preds = preds[:, :-1]
+    labels = labels[:, 1:]
     mask = labels != -100
     if mask.sum() == 0:
         return {"token_accuracy": 0.0}
@@ -429,6 +322,8 @@ def main():
     cfg = SFTConfig.from_yaml(args.config)
     if args.override_output_dir:
         cfg.output_dir = args.override_output_dir
+    if cfg.deepspeed_config and not args.debug and not args.smoke_test:
+        setup_deepspeed()
 
     set_seed(cfg.seed)
     logger.info("=" * 60)
@@ -458,14 +353,21 @@ def main():
     else:
         report_to = ["none"]
 
+    model_config = AutoConfig.from_pretrained(
+        cfg.base_model, revision=cfg.model_revision, trust_remote_code=True
+    )
+    model_class = model_class_for_config(model_config, transformers)
+    is_qwen35 = model_config.model_type == "qwen3_5"
+    if is_qwen35 and not isinstance(cfg.enable_thinking, bool):
+        raise ValueError("Qwen3.5 requires explicit enable_thinking: false or true")
+
     # --- Tokenizer ---
     logger.info("Loading tokenizer: %s", cfg.base_model)
-    # use_fast=False: the ptca AML conda env has tokenizers 0.19.x (Python 3.8 ceiling).
-    # Qwen3's tokenizer.json uses the ModelWrapper format introduced in tokenizers>=0.20.0,
-    # so fast tokenizer loading always fails with "data did not match any variant of
-    # untagged enum ModelWrapper". The slow tokenizer is pure-Python, reads vocab/merges
-    # files directly, and has no version dependency on the Rust tokenizers extension.
-    tokenizer = AutoTokenizer.from_pretrained(cfg.base_model, trust_remote_code=True, use_fast=False)
+    # Preserve the slow tokenizer for legacy ptca; Qwen3.5 uses its native tokenizer.
+    tokenizer = AutoTokenizer.from_pretrained(
+        cfg.base_model, revision=cfg.model_revision,
+        trust_remote_code=not is_qwen35, use_fast=is_qwen35
+    )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -475,11 +377,13 @@ def main():
     train_ds = build_dataset(
         cfg.train_jsonl, tokenizer, cfg.max_seq_len, debug_n,
         mask_think_in_loss=cfg.mask_think_in_loss,
+        enable_thinking=cfg.enable_thinking,
     )
     logger.info("Building val dataset ...")
     val_ds = build_dataset(
         cfg.val_jsonl, tokenizer, cfg.max_seq_len, debug_n,
         mask_think_in_loss=cfg.mask_think_in_loss,
+        enable_thinking=cfg.enable_thinking,
     )
 
     if len(train_ds) == 0:
@@ -488,12 +392,16 @@ def main():
 
     # --- Model ---
     logger.info("Loading model: %s (attn=%s)", cfg.base_model, cfg.attn_implementation)
-    model = AutoModelForCausalLM.from_pretrained(
+    model = model_class.from_pretrained(
         cfg.base_model,
+        config=model_config,
+        revision=cfg.model_revision,
         torch_dtype=torch.bfloat16,
         attn_implementation=cfg.attn_implementation,
-        trust_remote_code=True,
+        trust_remote_code=not is_qwen35,
     )
+    if is_qwen35:
+        configure_qwen35_text_training(model)
     logger.info("Model loaded.")
     if cfg.gradient_checkpointing:
         model.gradient_checkpointing_enable()
@@ -532,7 +440,7 @@ def main():
         gradient_accumulation_steps=cfg.gradient_accumulation_steps,
         learning_rate=cfg.learning_rate,
         weight_decay=cfg.weight_decay,
-        warmup_ratio=cfg.warmup_ratio,
+        **warmup_arguments(transformers.TrainingArguments, cfg.warmup_ratio),
         lr_scheduler_type=cfg.lr_scheduler_type,
         logging_steps=logging_steps,
         eval_strategy=eval_strategy,
@@ -555,6 +463,7 @@ def main():
         dataloader_num_workers=2,
         dataloader_pin_memory=True,
         logging_first_step=True,
+        logging_nan_inf_filter=False,
     )
     logger.info("TrainingArguments built.")
 
@@ -585,23 +494,31 @@ def main():
         else:
             resume = cfg.resume_from_checkpoint
 
-    trainer.train(resume_from_checkpoint=resume)
+    train_result = trainer.train(resume_from_checkpoint=resume)
+    if not math.isfinite(train_result.training_loss):
+        raise RuntimeError("Training loss is not finite; refusing to export the model")
 
     # --- Save final ---
     logger.info("Saving final model to %s", cfg.output_dir)
     trainer.save_model()
-    tokenizer.save_pretrained(cfg.output_dir)
+    trainer.save_state()
     if trainer.is_world_process_zero():
+        tokenizer.save_pretrained(cfg.output_dir)
         with open(os.path.join(cfg.output_dir, "training_summary.json"), "w") as f:
             json.dump(
                 {
                     "step_key": cfg.step_key,
                     "base_model": cfg.base_model,
+                    "model_revision": cfg.model_revision,
+                    "model_class": model.__class__.__name__,
+                    "model_type": model.config.model_type,
+                    "enable_thinking": cfg.enable_thinking,
                     "train_jsonl": cfg.train_jsonl,
                     "val_jsonl": cfg.val_jsonl,
                     "best_metric": trainer.state.best_metric,
                     "best_model_checkpoint": trainer.state.best_model_checkpoint,
                     "global_step": trainer.state.global_step,
+                    "training_loss": train_result.training_loss,
                 },
                 f, indent=2,
             )

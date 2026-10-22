@@ -1,5 +1,103 @@
 # SFT — Execution Process (layer1-delta, Thinking 50K, GPT-4o teacher)
 
+## Qwen3.5 text-task compatibility (separate from the historical run below)
+
+The dense `Qwen/Qwen3.5-4B` checkpoint uses the full
+`Qwen3_5ForConditionalGeneration` class and `qwen3_5` config with nested text
+and vision configs. The trainer now selects that concrete native class,
+freezes its unused vision tower for text-only DDP, disables caching, and retains
+the full model configuration/weights on save. Other existing model families
+still use `AutoModelForCausalLM`. Some modern Transformers releases also map
+Qwen3.5 through that Auto class; the problem is **not** universal Auto-class
+incompatibility. The old Transformers 4.51.3 setup is incompatible with Qwen3.5.
+Text SFT accepts string message content only; it does not process images/videos.
+
+Use an isolated Python **3.10+** environment rather than altering the historical
+SFT/RL/vLLM installation:
+
+```bash
+# PIP_CONSTRAINT may point at an approved exact CUDA/torch stack lock.
+# Resolve and validate that GPU lock before any actual training submission.
+bash scripts/setup_env.sh --profile qwen35 --python /path/to/python3 \
+  --env-dir /new/path/qwen35-sft
+```
+
+This profile refuses existing environments, uses
+`env/qwen35-sft-requirements.txt`, checks dependency consistency, and records
+`resolved-requirements.txt` inside the environment. It never applies Python
+version-gate patches. The default `legacy` profile remains unchanged.
+The Qwen3.5 constraints pin Transformers **5.19.0** but do **not** claim a
+validated CUDA/driver/DeepSpeed stack; inherited `PIP_CONSTRAINT` is respected.
+The historical `env/pipeline-rl-pip-freeze.txt` is not a Qwen3.5 runtime lock.
+
+CPU regression evidence: Python 3.12.10, torch 2.14.1 (CUDA unavailable),
+Transformers 5.19.0, accelerate 1.15.0, datasets 5.1.0, tokenizers 0.23.2,
+safetensors 0.8.0, PyYAML 6.0.3. Tests include a tiny randomly initialized
+Qwen3.5 model with both linear and full attention, an actual optimizer update,
+full HF save/reload and equal reloaded logits. They do not download model weights.
+An additional local-cache-only tokenizer test uses official HF revision
+`851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`; it skips if metadata is absent.
+The existing shared CPU host has unrelated OpenTelemetry dependency conflicts
+reported by `pip check`; it is not a clean environment lock. The new Linux venv
+bootstrap itself still requires runtime validation.
+
+Render `sft/configs/sft/qwen35_text.yaml.tmpl` to a YAML with real paths. For
+an orchestration-approved bounded GPU smoke, use a fresh output directory,
+`max_seq_len: 1024`, batch/accumulation 1, no DeepSpeed and no resume:
+
+```bash
+unset PYTHONPATH PYTHONUSERBASE
+export PYTHONNOUSERSITE=1
+/new/path/qwen35-sft/bin/python sft/sft_train.py \
+  --config /path/to/rendered-smoke.yaml --max-steps 3 --no-wandb
+```
+
+`base_model` should be the fully staged checkpoint directory with immutable
+source provenance. For direct Hub loading, optional YAML `model_revision`
+is passed to config, tokenizer, and weights. Always set
+`enable_thinking: false` for the current nonreasoning gold targets and use the
+same chat-template flag for evaluation/inference. Qwen3.5 requires an explicit
+boolean setting. A generation prefix that does not exactly match the full
+training rendering is an error, not a guessed loss boundary.
+
+Assistant-only labels are computed **before** truncation, then shifted with the
+left-truncated input. Targets that cannot fit intact together with a preceding
+context token are skipped with a warning. Think masking never falls back to
+training a span it was asked to mask. Token accuracy now uses causal shifting.
+The warmup ratio is adapted to the installed Trainer API (`warmup_steps` ratios
+in modern releases, `warmup_ratio` in legacy releases); modern ratios must be
+less than 1 to avoid treating 1 as one absolute step.
+
+Task weighting is a **preparation contract**: the caller materializes positive
+integer frequency replication (currently HPF 2, GEM 1, MAI Profile 1) and removes
+`sample_weight`. The trainer preserves those repeated rows with uniform
+sampling; it does not also apply a weighted loss. Any remaining non-unit,
+nonfinite or invalid row weight fails before dataset column projection, even
+outside a debug subsample. Quality stays evaluation-only under the caller's
+split selection policy. Malformed JSON and unsafe template boundaries fail
+explicitly rather than silently reducing the corpus.
+
+Run CPU regressions with:
+
+```bash
+python -m unittest discover -s sft/tests -v
+```
+
+The final HF model and tokenizer are saved at `output_dir`, including the
+tokenizer chat template. Final `trainer_state.json` records step/log history;
+`training_summary.json` records finite training loss, concrete model class/type,
+thinking policy and source revision. Nonfinite training loss fails before final
+export. Load the export using
+`Qwen3_5ForConditionalGeneration.from_pretrained(output_dir)` and
+`AutoTokenizer.from_pretrained(output_dir)` for **text-only** inference.
+Image/video processing is outside this trainer's contract; it does not export
+an `AutoProcessor`. Serving also needs an architecture-compatible runtime and
+the same nonthinking flag. The historical vLLM 0.8.5 wrapper/shim is **not**
+proof of Qwen3.5 support; do not mix it into this training environment or mark
+GPU/serving readiness true from these CPU tests.
+
+---
+
 How the Layer1-delta SFT model (`Qwen3-4B-Thinking-2507` → distilled on GPT-4o
 teacher labels) was actually trained, with the **real, recovered hyperparameters**.
 This is the "how we trained it" companion to
