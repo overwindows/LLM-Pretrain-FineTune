@@ -1,0 +1,2 @@
+# Keep the delivered Linux bootstrap portable across Windows checkouts/archives.
+/scripts/setup_env.sh text eol=lf
