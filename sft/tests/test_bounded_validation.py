@@ -22,6 +22,7 @@ from test_sft_training import CharacterTokenizer, record
 class FakeEngine:
     dp_world_size = 1
     global_steps = 0
+    skipped_steps = 0
     optimizer = SimpleNamespace()
 
     def bfloat16_enabled(self):

@@ -100,8 +100,9 @@ GPU/serving readiness true from these CPU tests.
 
 ### Opt-in 8192-token ZeRO-3 bounded validation
 
-The next milestone is a **single-rank bounded validation**, not full training
-readiness. Retain the tested native-HF stack and install the exact candidate
+Bounded validation supports the original **one-rank** mode and an opt-in
+**eight-A100 jointly distributed** mode, not full training readiness. Retain
+the tested native-HF stack and install the exact candidate
 `deepspeed==0.16.9` after torch is installed, with `DS_BUILD_OPS=0` and
 `--no-build-isolation`. Keep the root job's exact `PIP_CONSTRAINT`; run `pip check`
 and persist the resolved freeze before model loading. No DeepSpeed package is
@@ -134,6 +135,15 @@ keys to the rendered trainer YAML:
 max_seq_len: 8192
 per_device_train_batch_size: 1
 gradient_accumulation_steps: 4
+optim: adamw_torch
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_epsilon: 1.0e-8
+learning_rate: 5.0e-6
+weight_decay: 0.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.03
+seed: 42
 enable_thinking: false
 deepspeed_config: /path/to/zero3_bf16.json
 resume_from_checkpoint: null
@@ -142,17 +152,40 @@ bounded_validation:
   expected_steps: 8
   warmup_steps: 2
   expected_zero_stage: 3
-  expected_world_size: 1
+  expected_world_size: 8  # 1 remains the default
 ```
 
-Launch with `torchrun --standalone --nproc_per_node=1 sft/sft_train.py
+After the orchestration owner verifies an actual eight-A100 allocation,
+launch with `torchrun --standalone --nnodes=1 --nproc_per_node=8 sft/sft_train.py
 --config <yaml> --max-steps 8 --no-wandb` from the isolated environment.
+Use `expected_world_size: 1` and `--nproc_per_node=1` for the original mode.
 The exact step cap must match `expected_steps` (at most 10); no debug/smoke flags
 or resume are allowed. The outer job owns the GPU count and hard timeout.
 `validation_fixed_order` is rejected outside bounded validation and selects
 `SequentialSampler`, preserving the caller's repeated task-frequency rows and
 planned near-cap coverage. Default training still uses the ordinary Trainer
 and sampler.
+
+In eight-rank mode, the optimizer is explicitly `adamw_torch`, and the actual
+engine must report `AdamW`. Muon is not implemented on this fixed stack:
+torch 2.6 does not provide it, and DeepSpeed 0.16.9 ZeRO-3 passes flattened
+partition buffers to the underlying optimizer, not the complete matrices
+required by the verified Muon implementation. An untested-optimizer switch
+does not repair that mathematical incompatibility.
+`optim`, `adam_beta1`, `adam_beta2`, and `adam_epsilon` are optional YAML
+pass-throughs to TrainingArguments; when omitted they leave legacy defaults
+unchanged (except the explicit eight-rank optimizer choice). Invalid or nonfinite
+beta/epsilon settings and any non-`adamw_torch` eight-rank choice are rejected.
+
+Accelerate shards the sequential batch sampler; do not install a second
+distributed sampler. With batch 1 and accumulation 4, rank `r` consumes indices
+`step*32 + micro*8 + r` (zero-based step/micro). Exactly 256 usable materialized
+rows and no tokenization skips are required for eight fixed-order updates.
+HPF's two copies remain distinct indices, not loss weights. Every microbatch's
+actual source indices are collectively checked **before forward**, and each
+update must cover its exact contiguous global group once. This proves
+materialized row ordering, not distinct source users or source-content
+uniqueness; those remain data-audit responsibilities.
 
 `bounded_validation.json` is atomically updated at training start and after
 each optimizer update, and embedded in the final `training_summary.json`.
@@ -168,6 +201,34 @@ its optimizer wrapper class and optimizer name, and snapshots
 automatic bucket/batch resolution. That snapshot represents the finalized
 configuration passed to DeepSpeed, not all of DeepSpeed's internal defaults.
 
+Eight-rank reports use `schema_version: 2`; one-rank reports retain version 1.
+Every rank writes only `bounded_validation.rankN.json`; only rank zero also
+writes the aggregate filename and final training summary. `runtime.ranks`
+contains all eight rank proofs, ordered by global rank: actual rank/world size,
+launcher local rank, hostname, CUDA index/visible-device count/physical UUID,
+device name/memory, backend, engine and optimizer identity, BF16, resolved
+configuration and package versions. Eight distinct physical UUIDs, A100 names,
+unique host/local-rank pairs, NCCL and consistent runtime settings are mandatory.
+Identified MIG devices are rejected.
+`zero3_initialization_ranks` preserves every rank's pre-load configuration and
+partitioned-parameter proof. `collective_proof` records an actual CUDA NCCL SUM
+of ranks plus one, with `actual == expected == 36`, before any optimizer update.
+Mocked tests cannot supply this runtime evidence.
+
+`runtime.optimizer_class` identifies the actual underlying `engine.basic_optimizer`,
+which must be a torch AdamW instance. `optimizer_group_proof` captures groups
+at `Trainer.create_optimizer`, **before** ZeRO replaces their original
+parameters with flattened partition buffers. It requires exact, duplicate-free
+identity coverage of all and only trainable parameters (tied weights counted
+once; frozen vision excluded), and reports tensor/full-element counts,
+group count, LR, weight decay, betas and epsilon without parameter values.
+Full element counts use ZeRO's `ds_numel` metadata when parameters are sharded.
+`underlying_optimizer_groups` separately records actual runtime hyperparameters
+after scheduler preparation; warmup can make its current `lr` zero while the
+pre-wrap proof retains the configured base LR. All ranks must agree on both
+snapshots. The CPU regression exercises a real tiny hybrid Qwen3.5 AdamW
+update and optimizer-state reload, not a distributed ZeRO update.
+
 Each optimizer update has CUDA synchronization at both ends, peak allocated and
 reserved bytes reset at its start, and actual microbatch input lengths,
 attended/padded tokens, causally supervised tokens and engine update count.
@@ -181,6 +242,33 @@ exclude dataset preparation, batch prefetch, logging, evaluation and export;
 extrapolate a full-run cost as though those excluded stages or sufficient
 evaluation had been measured. GPU validation and long-generation evaluation
 remain the orchestration session's responsibility.
+
+For version 2, each `steps` entry contains explicit per-rank `ranks` evidence
+and `row_indices`. Aggregate attended/supervised/padded tokens, examples and
+microbatch counts are **sums across ranks**; elapsed seconds are the **maximum**
+CUDA-synchronized rank interval after a start barrier. Peak allocated/reserved
+bytes and maximum sequence length are **per-device maxima**, not total GPU
+memory. Unpadded lengths and microbatch details retain all ranks' observations.
+Each rank must have one actual engine update, the same global step, a full
+accumulation group, no skipped update and finite losses. Forward losses are
+collectively checked before backward. The last six of eight global updates
+feed throughput; `final_ranks` preserves finite final losses/exact step counts
+and the maximum rank training wall time is reported.
+Version 2 also persists `engine_skipped_steps` and `engine_skipped_updates`;
+the actual engine's cumulative skipped-update counter must start at zero and
+never increase. `engine_optimizer_updates` subtracts that skip delta from
+the engine global-step delta, rather than assuming every counter increment
+was a successful update.
+
+Final model gathering/saving executes on **all** ranks, with barriers around
+the collective export; tokenizer and summary writes execute only on rank zero.
+`export_complete: true` is added only after collective model/state and
+rank-zero tokenizer save phases succeed. It does not claim reload or tensor
+validation: orchestration must check those after torchrun exits successfully.
+Ordinary local export failures are exchanged and persisted as failed reports.
+Hard process death or a failure inside a collective still requires torchrun's
+process supervision and the outer job's hard timeout; no in-process error
+exchange can guarantee recovery from a dead peer.
 
 ---
 

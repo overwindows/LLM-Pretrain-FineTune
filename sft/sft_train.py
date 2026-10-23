@@ -45,6 +45,7 @@ from transformers import (
 if __package__:
     from .bounded_validation import (
         BoundedValidationConfig, BoundedValidationTrainer, ValidationMeasurements,
+        collective_action, collective_check,
     )
     from .training_utils import (
         configure_qwen35_text_training,
@@ -57,6 +58,7 @@ if __package__:
 else:
     from bounded_validation import (
         BoundedValidationConfig, BoundedValidationTrainer, ValidationMeasurements,
+        collective_action, collective_check,
     )
     from training_utils import (
         configure_qwen35_text_training,
@@ -102,6 +104,10 @@ class SFTConfig:
     num_train_epochs: float = 3.0
     learning_rate: float = 5e-6
     weight_decay: float = 0.0
+    optim: str | None = None
+    adam_beta1: float | None = None
+    adam_beta2: float | None = None
+    adam_epsilon: float | None = None
     warmup_ratio: float = 0.03
     lr_scheduler_type: str = "cosine"
     seed: int = 42
@@ -203,7 +209,7 @@ def build_dataset(
 
     _SKIP = {"input_ids": [], "attention_mask": [], "labels": []}
 
-    def _map_fn(rec):
+    def _map_fn(rec, index):
         # tokenize_record returns None when the record should be skipped.
         # dataset.map requires consistent output columns across all rows, so
         # we return empty lists instead of None; the filter step removes them.
@@ -228,7 +234,10 @@ def build_dataset(
                 removed = stats["context_tokens_removed"]
                 validation_stats["left_truncated_records"] += int(removed > 0)
                 validation_stats["context_tokens_removed"] += removed
-        return result if result is not None else _SKIP
+        output = result if result is not None else dict(_SKIP)
+        if validation_stats is not None:
+            output["_validation_row_index"] = index
+        return output
 
     # New datasets versions also spawn a worker for num_proc=1.
     n_workers = None
@@ -239,6 +248,7 @@ def build_dataset(
 
     tokenized_ds = raw_ds.map(
         _map_fn,
+        with_indices=True,
         num_proc=n_workers,
         remove_columns=raw_ds.column_names,
         desc=f"Tokenizing {os.path.basename(jsonl_path)}",
@@ -284,11 +294,16 @@ class DataCollatorForSFT:
             input_ids.append(f["input_ids"] + [self.pad_token_id] * pad_len)
             attention_mask.append(f["attention_mask"] + [0] * pad_len)
             labels.append(f["labels"] + [-100] * pad_len)
-        return {
+        batch = {
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
             "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
             "labels": torch.tensor(labels, dtype=torch.long),
         }
+        if "_validation_row_index" in features[0]:
+            batch["_validation_row_index"] = torch.tensor(
+                [f["_validation_row_index"] for f in features], dtype=torch.long
+            )
+        return batch
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +381,23 @@ def main():
             or args.max_steps != validation.expected_steps or cfg.resume_from_checkpoint
         ):
             raise ValueError("Bounded validation requires active DeepSpeed, exact --max-steps and no resume/debug")
+    optimizer_args = {
+        key: getattr(cfg, key) for key in ("optim", "adam_beta1", "adam_beta2", "adam_epsilon")
+        if getattr(cfg, key) is not None
+    }
+    for key in ("adam_beta1", "adam_beta2", "adam_epsilon"):
+        if key in optimizer_args:
+            value = optimizer_args[key]
+            if (
+                isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+                or (key != "adam_epsilon" and not 0 <= value < 1)
+                or (key == "adam_epsilon" and value <= 0)
+            ):
+                raise ValueError(f"Invalid optimizer setting {key}")
+    if validation is not None and validation.expected_world_size == 8:
+        if cfg.optim not in (None, "adamw_torch"):
+            raise ValueError("Eight-GPU bounded validation requires optim: adamw_torch")
+        optimizer_args["optim"] = "adamw_torch"
 
     set_seed(cfg.seed)
     logger.info("=" * 60)
@@ -489,8 +521,21 @@ def main():
         dataloader_pin_memory=True,
         logging_first_step=True,
         logging_nan_inf_filter=False,
+        **optimizer_args,
     )
     logger.info("TrainingArguments built.")
+    if validation is not None and validation.expected_world_size == 8:
+        if training_args.world_size != 8:
+            raise RuntimeError("Expected eight distributed ranks before model loading")
+        if cfg.validation_fixed_order:
+            expected_rows = (
+                validation.expected_steps * 8 * cfg.per_device_train_batch_size
+                * cfg.gradient_accumulation_steps
+            )
+            if len(train_ds) != expected_rows or dataset_stats["train"]["skipped"]:
+                raise ValueError(
+                    f"Eight-rank fixed-order validation requires exactly {expected_rows} usable rows without skips"
+                )
 
     # TrainingArguments retains HfTrainerDeepSpeedConfig's weakref before
     # from_pretrained checks it to enter deepspeed.zero.Init for ZeRO-3.
@@ -517,8 +562,10 @@ def main():
     measurements = None
     if validation is not None:
         partitioned = sum(hasattr(p, "ds_id") for p in model.parameters())
-        if not partitioned:
-            raise RuntimeError("ZeRO-3 model loading did not produce partitioned parameters")
+        collective_check(
+            "ZeRO-3 model loading did not produce partitioned parameters" if not partitioned else None,
+            validation, "partitioned model loading",
+        )
         measurements = ValidationMeasurements(validation, cfg.output_dir)
         measurements.report.update({
             "dataset_stats": dataset_stats,
@@ -574,30 +621,58 @@ def main():
         raise RuntimeError("Training loss is not finite; refusing to export the model")
 
     # --- Save final ---
+    distributed_validation = measurements is not None and validation.expected_world_size == 8
+
+    def save_weights():
+        # ZeRO-3's 16-bit gather requires every rank, not only rank zero.
+        trainer.save_model()
+        trainer.save_state()
+
+    def save_tokenizer():
+        if trainer.is_world_process_zero():
+            tokenizer.save_pretrained(cfg.output_dir)
+
+    def save_summary():
+        if trainer.is_world_process_zero():
+            with open(os.path.join(cfg.output_dir, "training_summary.json"), "w") as f:
+                json.dump(
+                    {
+                        "step_key": cfg.step_key,
+                        "base_model": cfg.base_model,
+                        "model_revision": cfg.model_revision,
+                        "model_class": model.__class__.__name__,
+                        "model_type": model.config.model_type,
+                        "enable_thinking": cfg.enable_thinking,
+                        "train_jsonl": cfg.train_jsonl,
+                        "val_jsonl": cfg.val_jsonl,
+                        "best_metric": trainer.state.best_metric,
+                        "best_model_checkpoint": trainer.state.best_model_checkpoint,
+                        "global_step": trainer.state.global_step,
+                        "training_loss": train_result.training_loss,
+                        **({"bounded_validation": measurements.report} if measurements is not None else {}),
+                    },
+                    f, indent=2,
+                )
+
     logger.info("Saving final model to %s", cfg.output_dir)
-    trainer.save_model()
-    trainer.save_state()
-    if trainer.is_world_process_zero():
-        tokenizer.save_pretrained(cfg.output_dir)
-        with open(os.path.join(cfg.output_dir, "training_summary.json"), "w") as f:
-            json.dump(
-                {
-                    "step_key": cfg.step_key,
-                    "base_model": cfg.base_model,
-                    "model_revision": cfg.model_revision,
-                    "model_class": model.__class__.__name__,
-                    "model_type": model.config.model_type,
-                    "enable_thinking": cfg.enable_thinking,
-                    "train_jsonl": cfg.train_jsonl,
-                    "val_jsonl": cfg.val_jsonl,
-                    "best_metric": trainer.state.best_metric,
-                    "best_model_checkpoint": trainer.state.best_model_checkpoint,
-                    "global_step": trainer.state.global_step,
-                    "training_loss": train_result.training_loss,
-                    **({"bounded_validation": measurements.report} if measurements is not None else {}),
-                },
-                f, indent=2,
-            )
+    try:
+        if distributed_validation:
+            torch.distributed.barrier()
+            collective_action(save_weights, validation, "full model export")
+            torch.distributed.barrier()
+            collective_action(save_tokenizer, validation, "rank-zero tokenizer export")
+            measurements.report["export_complete"] = True
+            measurements.persist()
+            collective_action(save_summary, validation, "rank-zero final summary")
+            torch.distributed.barrier()
+        else:
+            save_weights()
+            save_tokenizer()
+            save_summary()
+    except Exception as exc:
+        if measurements is not None:
+            measurements.fail(exc)
+        raise
     logger.info("Done.")
 
 
