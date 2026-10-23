@@ -121,17 +121,22 @@ def tokenize_record(
     mask_think_in_loss: bool = False,
     think_close_ids: list[int] | None = None,
     enable_thinking: bool | None = None,
+    stats: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     validate_sample_weight(rec)
     if max_seq_len < 2:
         raise ValueError("max_seq_len must be at least 2 for causal loss")
     messages = rec.get("messages", [])
     if len(messages) < 2 or messages[-1].get("role") != "assistant":
+        if stats is not None:
+            stats["skip_reason"] = "no_final_assistant"
         logger.warning("Skipping record without a final assistant target")
         return None
     if any(not isinstance(m.get("content"), str) for m in messages):
         raise ValueError("Text SFT requires string content; multimodal rows are unsupported")
     if not messages[-1]["content"].strip():
+        if stats is not None:
+            stats["skip_reason"] = "empty_target"
         logger.warning("Skipping empty assistant target")
         return None
 
@@ -141,7 +146,11 @@ def tokenize_record(
     )
     # Retain a predecessor for the first target token's causal prediction.
     offset = max(0, len(full_ids) - max_seq_len)
+    if stats is not None:
+        stats.update({"original_length": end, "context_tokens_removed": offset})
     if start < 1 or offset >= start or end <= start:
+        if stats is not None:
+            stats["skip_reason"] = "target_does_not_fit"
         logger.warning("Skipping target that cannot fit intact with a context token")
         return None
 
@@ -151,6 +160,8 @@ def tokenize_record(
         if rel >= 0:
             train_start = start + rel + len(think_close_ids)
     if train_start >= end:
+        if stats is not None:
+            stats["skip_reason"] = "no_supervised_tokens"
         logger.warning("Skipping record with no supervised tokens after think masking")
         return None
 

@@ -43,6 +43,9 @@ from transformers import (
 )
 
 if __package__:
+    from .bounded_validation import (
+        BoundedValidationConfig, BoundedValidationTrainer, ValidationMeasurements,
+    )
     from .training_utils import (
         configure_qwen35_text_training,
         find_think_close_token_ids,
@@ -52,6 +55,9 @@ if __package__:
         warmup_arguments,
     )
 else:
+    from bounded_validation import (
+        BoundedValidationConfig, BoundedValidationTrainer, ValidationMeasurements,
+    )
     from training_utils import (
         configure_qwen35_text_training,
         find_think_close_token_ids,
@@ -121,6 +127,8 @@ class SFTConfig:
     # None preserves legacy defaults. Qwen3.5 requires an explicit policy.
     enable_thinking: bool | None = None
     model_revision: str | None = None
+    bounded_validation: dict[str, Any] | None = None
+    validation_fixed_order: bool = False
 
     @classmethod
     def from_yaml(cls, path: str) -> "SFTConfig":
@@ -156,6 +164,7 @@ def build_dataset(
     mask_think_in_loss: bool = False,
     num_proc: int | None = None,
     enable_thinking: bool | None = None,
+    validation_stats: dict[str, Any] | None = None,
 ) -> Dataset:
     """Build a tokenized HuggingFace Dataset from a JSONL file.
 
@@ -171,6 +180,12 @@ def build_dataset(
         rec.pop("sample_weight", None)
     if debug_subsample:
         records = records[:debug_subsample]
+    if validation_stats is not None:
+        validation_stats.update({
+            "records": len(records), "kept": 0, "skipped": 0,
+            "left_truncated_records": 0, "context_tokens_removed": 0,
+            "skip_reasons": {},
+        })
 
     think_close_ids: list[int] = []
     if mask_think_in_loss:
@@ -192,6 +207,7 @@ def build_dataset(
         # tokenize_record returns None when the record should be skipped.
         # dataset.map requires consistent output columns across all rows, so
         # we return empty lists instead of None; the filter step removes them.
+        stats = {} if validation_stats is not None else None
         result = tokenize_record(
             rec,
             tokenizer,
@@ -199,7 +215,19 @@ def build_dataset(
             mask_think_in_loss=mask_think_in_loss,
             think_close_ids=think_close_ids,
             enable_thinking=enable_thinking,
+            stats=stats,
         )
+        if validation_stats is not None:
+            if result is None:
+                validation_stats["skipped"] += 1
+                reason = stats["skip_reason"]
+                reasons = validation_stats["skip_reasons"]
+                reasons[reason] = reasons.get(reason, 0) + 1
+            else:
+                validation_stats["kept"] += 1
+                removed = stats["context_tokens_removed"]
+                validation_stats["left_truncated_records"] += int(removed > 0)
+                validation_stats["context_tokens_removed"] += removed
         return result if result is not None else _SKIP
 
     # New datasets versions also spawn a worker for num_proc=1.
@@ -215,7 +243,7 @@ def build_dataset(
         remove_columns=raw_ds.column_names,
         desc=f"Tokenizing {os.path.basename(jsonl_path)}",
         # Keep only records where input_ids was produced (skip → empty dict)
-        load_from_cache_file=True,
+        load_from_cache_file=validation_stats is None,
     )
 
     # Filter out skipped records (empty lists from _SKIP sentinel)
@@ -322,8 +350,22 @@ def main():
     cfg = SFTConfig.from_yaml(args.config)
     if args.override_output_dir:
         cfg.output_dir = args.override_output_dir
+    if not isinstance(cfg.validation_fixed_order, bool):
+        raise ValueError("validation_fixed_order must be boolean")
     if cfg.deepspeed_config and not args.debug and not args.smoke_test:
         setup_deepspeed()
+    validation = (
+        BoundedValidationConfig.parse(cfg.bounded_validation)
+        if cfg.bounded_validation is not None else None
+    )
+    if cfg.validation_fixed_order and validation is None:
+        raise ValueError("validation_fixed_order requires bounded_validation")
+    if validation is not None:
+        if (
+            not cfg.deepspeed_config or args.debug or args.smoke_test
+            or args.max_steps != validation.expected_steps or cfg.resume_from_checkpoint
+        ):
+            raise ValueError("Bounded validation requires active DeepSpeed, exact --max-steps and no resume/debug")
 
     set_seed(cfg.seed)
     logger.info("=" * 60)
@@ -373,42 +415,25 @@ def main():
 
     # --- Datasets ---
     debug_n = 32 if (args.debug or args.smoke_test) else None
+    dataset_stats = {"train": {}, "val": {}} if validation is not None else None
     logger.info("Building train dataset ...")
     train_ds = build_dataset(
         cfg.train_jsonl, tokenizer, cfg.max_seq_len, debug_n,
         mask_think_in_loss=cfg.mask_think_in_loss,
         enable_thinking=cfg.enable_thinking,
+        validation_stats=dataset_stats["train"] if dataset_stats is not None else None,
     )
     logger.info("Building val dataset ...")
     val_ds = build_dataset(
         cfg.val_jsonl, tokenizer, cfg.max_seq_len, debug_n,
         mask_think_in_loss=cfg.mask_think_in_loss,
         enable_thinking=cfg.enable_thinking,
+        validation_stats=dataset_stats["val"] if dataset_stats is not None else None,
     )
 
     if len(train_ds) == 0:
         logger.error("Empty train dataset")
         sys.exit(2)
-
-    # --- Model ---
-    logger.info("Loading model: %s (attn=%s)", cfg.base_model, cfg.attn_implementation)
-    model = model_class.from_pretrained(
-        cfg.base_model,
-        config=model_config,
-        revision=cfg.model_revision,
-        torch_dtype=torch.bfloat16,
-        attn_implementation=cfg.attn_implementation,
-        trust_remote_code=not is_qwen35,
-    )
-    if is_qwen35:
-        configure_qwen35_text_training(model)
-    logger.info("Model loaded.")
-    if cfg.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
-        # Required for DeepSpeed ZeRO-3 + gradient checkpointing
-        if hasattr(model, "enable_input_require_grads"):
-            model.enable_input_require_grads()
-    logger.info("Gradient checkpointing applied.")
 
     # --- TrainingArguments ---
     logger.info("Building TrainingArguments ...")
@@ -467,10 +492,52 @@ def main():
     )
     logger.info("TrainingArguments built.")
 
+    # TrainingArguments retains HfTrainerDeepSpeedConfig's weakref before
+    # from_pretrained checks it to enter deepspeed.zero.Init for ZeRO-3.
+    if validation is not None:
+        from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
+        if not is_deepspeed_zero3_enabled():
+            raise RuntimeError("ZeRO-3 configuration must be active before model loading")
+
+    logger.info("Loading model: %s (attn=%s)", cfg.base_model, cfg.attn_implementation)
+    model = model_class.from_pretrained(
+        cfg.base_model,
+        config=model_config,
+        revision=cfg.model_revision,
+        torch_dtype=torch.bfloat16,
+        attn_implementation=cfg.attn_implementation,
+        trust_remote_code=not is_qwen35,
+    )
+    if is_qwen35:
+        configure_qwen35_text_training(model)
+    if cfg.gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+    measurements = None
+    if validation is not None:
+        partitioned = sum(hasattr(p, "ds_id") for p in model.parameters())
+        if not partitioned:
+            raise RuntimeError("ZeRO-3 model loading did not produce partitioned parameters")
+        measurements = ValidationMeasurements(validation, cfg.output_dir)
+        measurements.report.update({
+            "dataset_stats": dataset_stats,
+            "zero3_initialization": {
+                "active_before_from_pretrained": True,
+                "partitioned_parameter_count": partitioned,
+            },
+            "validation_fixed_order": cfg.validation_fixed_order,
+        })
+
     collator = DataCollatorForSFT(pad_token_id=tokenizer.pad_token_id)
 
     logger.info("Constructing Trainer ...")
-    trainer = Trainer(
+    trainer_class = BoundedValidationTrainer if measurements is not None else Trainer
+    validation_kwargs = (
+        {"measurements": measurements, "fixed_order": cfg.validation_fixed_order}
+        if measurements is not None else {}
+    )
+    trainer = trainer_class(
         model=model,
         args=training_args,
         train_dataset=train_ds,
@@ -479,6 +546,7 @@ def main():
         processing_class=tokenizer,
         compute_metrics=compute_metrics if eval_strategy != "no" else None,
         preprocess_logits_for_metrics=preprocess_logits_for_metrics if eval_strategy != "no" else None,
+        **validation_kwargs,
     )
     logger.info("Trainer constructed.")
 
@@ -494,7 +562,14 @@ def main():
         else:
             resume = cfg.resume_from_checkpoint
 
-    train_result = trainer.train(resume_from_checkpoint=resume)
+    try:
+        train_result = trainer.train(resume_from_checkpoint=resume)
+        if measurements is not None:
+            measurements.finish(trainer.state.global_step, train_result.training_loss)
+    except Exception as exc:
+        if measurements is not None:
+            measurements.fail(exc)
+        raise
     if not math.isfinite(train_result.training_loss):
         raise RuntimeError("Training loss is not finite; refusing to export the model")
 
@@ -519,6 +594,7 @@ def main():
                     "best_model_checkpoint": trainer.state.best_model_checkpoint,
                     "global_step": trainer.state.global_step,
                     "training_loss": train_result.training_loss,
+                    **({"bounded_validation": measurements.report} if measurements is not None else {}),
                 },
                 f, indent=2,
             )

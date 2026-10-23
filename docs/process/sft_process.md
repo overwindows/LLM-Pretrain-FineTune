@@ -98,6 +98,87 @@ GPU/serving readiness true from these CPU tests.
 
 ---
 
+### Opt-in 8192-token ZeRO-3 bounded validation
+
+The next milestone is a **single-rank bounded validation**, not full training
+readiness. Retain the tested native-HF stack and install the exact candidate
+`deepspeed==0.16.9` after torch is installed, with `DS_BUILD_OPS=0` and
+`--no-build-isolation`. Keep the root job's exact `PIP_CONSTRAINT`; run `pip check`
+and persist the resolved freeze before model loading. No DeepSpeed package is
+added to the default legacy or native-HF environment.
+
+Candidate evidence (not proof of this model's GPU runtime compatibility):
+[DeepSpeed 0.16.9's upstream CUDA CI](https://github.com/deepspeedai/DeepSpeed/blob/v0.16.9/.github/workflows/nv-torch-latest-v100.yml)
+explicitly tests torch 2.6 / CUDA 12.4. Its
+[package requirements](https://github.com/deepspeedai/DeepSpeed/blob/v0.16.9/requirements/requirements.txt)
+allow torch 2.6 and pydantic >=2. The PyPI sdist SHA256 is
+`88dc08986cd321047c37c2d0f1edd6faac498a1b52eb486d559164362c6b9011`.
+The pinned source exposes `DeepSpeedEngine.zero_optimization_stage`,
+`set_gradient_accumulation_boundary`, batch-size accessors and `global_steps`,
+which are used by Accelerate 1.15 and the runtime proof. Its checkpoint loader
+already specifies `weights_only=False`; no global torch-load patch is applied
+to this version. This session's CPU/mock tests do not establish Linux dependency
+resolution, CUDA kernels or 8192-token memory safety.
+
+`TrainingArguments` is now constructed **before** `from_pretrained`, retaining
+the HF DeepSpeed config weak reference used for `deepspeed.zero.Init`.
+HF 5.19 also resolves automatic ZeRO buckets from Qwen3.5's nested
+`text_config.hidden_size`. The full conditional-generation model is preserved,
+with its unused visual tower frozen before the optimizer is constructed.
+
+Use the orchestration-owned stage-3 JSON (BF16 and batch sizes automatic,
+gather 16-bit weights on save, no offload/optimizer/scheduler blocks). Add these
+keys to the rendered trainer YAML:
+
+```yaml
+max_seq_len: 8192
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 4
+enable_thinking: false
+deepspeed_config: /path/to/zero3_bf16.json
+resume_from_checkpoint: null
+validation_fixed_order: true
+bounded_validation:
+  expected_steps: 8
+  warmup_steps: 2
+  expected_zero_stage: 3
+  expected_world_size: 1
+```
+
+Launch with `torchrun --standalone --nproc_per_node=1 sft/sft_train.py
+--config <yaml> --max-steps 8 --no-wandb` from the isolated environment.
+The exact step cap must match `expected_steps` (at most 10); no debug/smoke flags
+or resume are allowed. The outer job owns the GPU count and hard timeout.
+`validation_fixed_order` is rejected outside bounded validation and selects
+`SequentialSampler`, preserving the caller's repeated task-frequency rows and
+planned near-cap coverage. Default training still uses the ordinary Trainer
+and sampler.
+
+`bounded_validation.json` is atomically updated at training start and after
+each optimizer update, and embedded in the final `training_summary.json`.
+It records actual engine class, ZeRO stage, initialized distributed world size,
+batch/accumulation settings, device/package versions, and pre-load ZeRO-3
+configuration/partitioned-parameter proof. Inactive/mismatched DeepSpeed,
+skipped updates, partial accumulation groups, nonfinite microbatch losses or
+an incorrect final step count fail explicitly. A failure during training leaves
+a failed-status report rather than success-shaped evidence.
+
+Each optimizer update has CUDA synchronization at both ends, peak allocated and
+reserved bytes reset at its start, and actual microbatch input lengths,
+attended/padded tokens, causally supervised tokens and engine update count.
+Microbatch losses are the values returned by Trainer (not an independently
+normalized per-example metric). Preparation separately counts kept/skipped rows,
+skip reasons and valid left-context truncation. Dataset diagnostics do not
+include per-example content. Warmup updates are excluded from the aggregate
+attended-token, supervised-token and example throughput. These update intervals
+exclude dataset preparation, batch prefetch, logging, evaluation and export;
+`training_wall_seconds` additionally includes inter-update overhead. Do not
+extrapolate a full-run cost as though those excluded stages or sufficient
+evaluation had been measured. GPU validation and long-generation evaluation
+remain the orchestration session's responsibility.
+
+---
+
 How the Layer1-delta SFT model (`Qwen3-4B-Thinking-2507` → distilled on GPT-4o
 teacher labels) was actually trained, with the **real, recovered hyperparameters**.
 This is the "how we trained it" companion to

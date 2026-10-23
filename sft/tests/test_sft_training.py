@@ -343,18 +343,32 @@ class ModelTests(unittest.TestCase):
                 "eval_strategy": "no", "save_strategy": "no",
             }), encoding="utf-8")
 
+            initialization_order = []
+            original_load = Qwen3_5ForConditionalGeneration.from_pretrained
+
             def cpu_arguments(**kwargs):
+                initialization_order.append("training_arguments")
                 kwargs["use_cpu"] = True
                 kwargs["dataloader_num_workers"] = 0
                 kwargs["dataloader_pin_memory"] = False
                 kwargs["disable_tqdm"] = True
                 return TrainingArguments(**kwargs)
 
+            def load_after_arguments(*args, **kwargs):
+                self.assertEqual(initialization_order, ["training_arguments"])
+                initialization_order.append("from_pretrained")
+                return original_load(*args, **kwargs)
+
             with patch("sys.argv", [
                 "sft_train.py", "--config", str(config_path),
                 "--max-steps", "2", "--no-wandb",
-            ]), patch.object(sft_train, "TrainingArguments", side_effect=cpu_arguments):
+            ]), patch.object(
+                sft_train, "TrainingArguments", side_effect=cpu_arguments
+            ), patch.object(
+                Qwen3_5ForConditionalGeneration, "from_pretrained", side_effect=load_after_arguments
+            ):
                 sft_train.main()
+            self.assertEqual(initialization_order, ["training_arguments", "from_pretrained"])
             summary = json.loads((output / "training_summary.json").read_text())
             self.assertEqual(summary["global_step"], 2)
             self.assertTrue(np.isfinite(summary["training_loss"]))
