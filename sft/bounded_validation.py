@@ -51,6 +51,8 @@ def deepspeed_proof(trainer, config: BoundedValidationConfig) -> dict[str, Any]:
         raise RuntimeError(f"DeepSpeed runtime mismatch: stage={stage}, world_size={world_size}")
     if not torch.cuda.is_available():
         raise RuntimeError("Bounded DeepSpeed measurements require an actual CUDA device")
+    if not engine.bfloat16_enabled():
+        raise RuntimeError("Bounded DeepSpeed validation requires actual BF16 execution")
     if (
         engine.dp_world_size != config.expected_world_size
         or engine.gradient_accumulation_steps() != trainer.args.gradient_accumulation_steps
@@ -61,6 +63,10 @@ def deepspeed_proof(trainer, config: BoundedValidationConfig) -> dict[str, Any]:
         )
     ):
         raise RuntimeError("DeepSpeed engine batch/parallel settings differ from TrainingArguments")
+    # This public HF/Accelerate config is finalized before engine preparation.
+    # It records resolved input values, not every engine-internal default.
+    resolved_config = trainer.accelerator.state.deepspeed_plugin.hf_ds_config.config
+    resolved_config = json.loads(json.dumps(resolved_config, allow_nan=False))
     return {
         "engine_class": f"{type(engine).__module__}.{type(engine).__name__}",
         "zero_stage": stage,
@@ -70,6 +76,10 @@ def deepspeed_proof(trainer, config: BoundedValidationConfig) -> dict[str, Any]:
         "gradient_accumulation_steps": engine.gradient_accumulation_steps(),
         "micro_batch_size": engine.train_micro_batch_size_per_gpu(),
         "train_batch_size": engine.train_batch_size(),
+        "bf16_enabled": bool(engine.bfloat16_enabled()),
+        "resolved_hf_deepspeed_config": resolved_config,
+        "engine_optimizer_class": f"{type(engine.optimizer).__module__}.{type(engine.optimizer).__name__}",
+        "optimizer_name": engine.optimizer_name(),
         "deepspeed_version": deepspeed.__version__,
         "torch_version": torch.__version__,
         "cuda_version": torch.version.cuda,

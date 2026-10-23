@@ -22,6 +22,13 @@ from test_sft_training import CharacterTokenizer, record
 class FakeEngine:
     dp_world_size = 1
     global_steps = 0
+    optimizer = SimpleNamespace()
+
+    def bfloat16_enabled(self):
+        return True
+
+    def optimizer_name(self):
+        return "AdamW"
 
     def zero_optimization_stage(self):
         return 3
@@ -47,7 +54,15 @@ class BoundedValidationTests(unittest.TestCase):
         return SimpleNamespace(
             model_wrapped=FakeEngine(), is_deepspeed_enabled=True,
             args=SimpleNamespace(gradient_accumulation_steps=2, per_device_train_batch_size=2),
-            accelerator=SimpleNamespace(optimizer_step_was_skipped=False),
+            accelerator=SimpleNamespace(
+                optimizer_step_was_skipped=False,
+                state=SimpleNamespace(deepspeed_plugin=SimpleNamespace(
+                    hf_ds_config=SimpleNamespace(config={
+                        "zero_optimization": {"stage": 3, "reduce_bucket_size": 1024},
+                        "bf16": {"enabled": True},
+                    })
+                )),
+            ),
         )
 
     def test_config_caps_and_invalid_settings(self):
@@ -77,6 +92,19 @@ class BoundedValidationTests(unittest.TestCase):
             self.assertEqual(proof["zero_stage"], 3)
             self.assertEqual(proof["world_size"], 1)
             self.assertEqual(proof["train_batch_size"], 4)
+            self.assertIs(proof["bf16_enabled"], True)
+            self.assertEqual(
+                proof["resolved_hf_deepspeed_config"]["zero_optimization"]["reduce_bucket_size"],
+                1024,
+            )
+            self.assertEqual(proof["optimizer_name"], "AdamW")
+            self.assertEqual(proof["engine_optimizer_class"], "types.SimpleNamespace")
+            trainer.accelerator.state.deepspeed_plugin.hf_ds_config.config["bf16"]["enabled"] = False
+            self.assertIs(proof["resolved_hf_deepspeed_config"]["bf16"]["enabled"], True)
+            trainer.accelerator.state.deepspeed_plugin.hf_ds_config.config["bf16"]["enabled"] = True
+            with patch.object(trainer.model_wrapped, "bfloat16_enabled", return_value=False):
+                with self.assertRaisesRegex(RuntimeError, "BF16"):
+                    deepspeed_proof(trainer, self.config())
             trainer.is_deepspeed_enabled = False
             with self.assertRaisesRegex(RuntimeError, "inactive"):
                 deepspeed_proof(trainer, self.config())

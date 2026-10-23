@@ -162,6 +162,11 @@ configuration/partitioned-parameter proof. Inactive/mismatched DeepSpeed,
 skipped updates, partial accumulation groups, nonfinite microbatch losses or
 an incorrect final step count fail explicitly. A failure during training leaves
 a failed-status report rather than success-shaped evidence.
+Runtime proof also requires `bf16_enabled: true` from the actual engine, records
+its optimizer wrapper class and optimizer name, and snapshots
+`resolved_hf_deepspeed_config` from the public HF/Accelerate integration after
+automatic bucket/batch resolution. That snapshot represents the finalized
+configuration passed to DeepSpeed, not all of DeepSpeed's internal defaults.
 
 Each optimizer update has CUDA synchronization at both ends, peak allocated and
 reserved bytes reset at its start, and actual microbatch input lengths,
