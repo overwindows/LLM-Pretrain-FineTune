@@ -6,15 +6,152 @@ import importlib.metadata
 import json
 import math
 import os
+import pickle
+import random
 import socket
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 from torch.utils.data import SequentialSampler
 from transformers import Trainer, TrainerCallback
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def state_sha256(value) -> str:
+    """Hash structured state including tensor bytes without serializing tensor objects."""
+    digest = hashlib.sha256()
+
+    def visit(item):
+        if isinstance(item, torch.Tensor):
+            tensor = item.detach().reshape(-1)
+            digest.update(f"tensor:{item.dtype}:{tuple(item.shape)}:".encode())
+            for start in range(0, tensor.numel(), 1024 * 1024):
+                chunk = tensor[start:start + 1024 * 1024].contiguous().cpu()
+                if (chunk.is_floating_point() or chunk.is_complex()) and not bool(torch.isfinite(chunk).all()):
+                    raise ValueError("Nonfinite tensor in checkpoint state fingerprint")
+                digest.update(chunk.view(torch.uint8).numpy().tobytes())
+        elif isinstance(item, dict):
+            digest.update(b"dict:")
+            for key in sorted(item, key=lambda key: (type(key).__name__, str(key))):
+                visit(key)
+                visit(item[key])
+        elif isinstance(item, (tuple, list)):
+            digest.update(f"{type(item).__name__}:{len(item)}:".encode())
+            for child in item:
+                visit(child)
+        else:
+            digest.update(json.dumps(item, allow_nan=False, sort_keys=True).encode())
+            digest.update(b";")
+
+    visit(value)
+    return digest.hexdigest()
+
+
+def rng_sha256() -> str:
+    return state_sha256({
+        "python_numpy": pickle.dumps((random.getstate(), np.random.get_state())).hex(),
+        "cpu": torch.random.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+    })
+
+
+def checkpoint_state_proof(trainer) -> dict[str, Any]:
+    engine = trainer.model_wrapped
+    optimizer = engine.basic_optimizer
+    partitions = engine.optimizer.fp32_partitioned_groups_flat
+    states = [optimizer.state.get(parameter, {}) for parameter in partitions]
+    steps = [state["step"].item() if isinstance(state.get("step"), torch.Tensor)
+             else state.get("step") for state in states]
+    step = trainer.state.global_step
+    if not partitions or any(isinstance(value, bool) or value != step for value in steps):
+        raise RuntimeError("Actual AdamW partition state does not match checkpoint optimizer step")
+    scheduler = trainer.lr_scheduler.state_dict()
+    if scheduler.get("last_epoch") != step or engine.global_steps != step or engine.skipped_steps != 0:
+        raise RuntimeError("Checkpoint engine/scheduler/optimizer counters disagree")
+    return {
+        "global_step": step,
+        "optimizer_partition_count": len(partitions),
+        "optimizer_steps": [int(value) for value in steps],
+        "model_sha256": state_sha256({
+            "parameters": [(name, getattr(parameter, "ds_tensor", parameter))
+                           for name, parameter in trainer.model.named_parameters()],
+            "persistent_buffers": [
+                (f"{name}.{key}", value) for name, module in trainer.model.named_modules()
+                for key, value in module.named_buffers(recurse=False)
+                if key not in module._non_persistent_buffers_set
+            ],
+        }),
+        "optimizer_sha256": state_sha256({
+            "fp32_master_partitions": partitions, "states": states,
+            "groups": optimizer_hyperparameters(optimizer),
+        }),
+        "scheduler_sha256": state_sha256(scheduler),
+    }
+
+
+def atomic_json(path: Path, value) -> None:
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(value, indent=2, allow_nan=False), encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def checkpoint_inventory(path: Path, world_size: int, step: int) -> dict[str, Any]:
+    tag = f"global_step{step}"
+    if (path / "latest").read_text().strip() != tag:
+        raise ValueError("DeepSpeed latest tag differs from the checkpoint step")
+    required = ["trainer_state.json", "scheduler.pt", "training_args.bin"]
+    for rank in range(world_size):
+        required.extend([
+            f"rng_state_{rank}.pth" if world_size > 1 else "rng_state.pth",
+            f"checkpoint_rank{rank}.json",
+            f"{tag}/zero_pp_rank_{rank}_mp_rank_00_model_states.pt",
+            f"{tag}/bf16_zero_pp_rank_{rank}_mp_rank_00_optim_states.pt",
+        ])
+    for name in required:
+        if not (path / name).is_file() or (path / name).stat().st_size <= 0:
+            raise ValueError(f"Missing full training checkpoint artifact: {name}")
+    state = json.loads((path / "trainer_state.json").read_text())
+    if state["global_step"] != step:
+        raise ValueError("Saved Trainer global step differs from checkpoint step")
+    return {
+        file.relative_to(path).as_posix(): {"bytes": file.stat().st_size, "sha256": file_sha256(file)}
+        for file in sorted(path.rglob("*"))
+        if file.is_file() and file.name != "bounded_checkpoint.json"
+    }
+
+
+def validate_checkpoint(path: Path, contract: dict[str, Any], config: "BoundedValidationConfig",
+                        checkpoint_step: int, verify_files: bool = True) -> dict[str, Any]:
+    manifest = json.loads((path / "bounded_checkpoint.json").read_text())
+    if (
+        manifest.get("schema_version") != 1 or manifest.get("contract") != contract
+        or manifest.get("checkpoint_step") != checkpoint_step
+        or not 0 < checkpoint_step < config.expected_steps
+    ):
+        raise ValueError("Checkpoint is incompatible with the exact training/configuration contract")
+    if verify_files and checkpoint_inventory(path, config.expected_world_size, checkpoint_step) != manifest["files"]:
+        raise ValueError("Checkpoint inventory/content hashes differ from the completed checkpoint")
+    state = json.loads((path / "trainer_state.json").read_text())
+    if state["max_steps"] != config.expected_steps:
+        raise ValueError("Checkpoint scheduler horizon/total optimizer-step ceiling changed")
+    report = manifest["measurements"]
+    if (
+        report["status"] != "checkpoint_saved"
+        or [item["global_step"] for item in report["steps"]] != list(range(1, checkpoint_step + 1))
+    ):
+        raise ValueError("Checkpoint lacks complete preceding optimizer-step evidence")
+    return manifest
 
 
 @dataclass(frozen=True)
@@ -231,6 +368,10 @@ class ValidationMeasurements(TrainerCallback):
         self.trainer = None
         self.started = None
         self.pending: list[dict[str, Any]] = []
+        self.checkpoint_step = None
+        self.checkpoint_contract = None
+        self.resume_manifest = None
+        self.resume_path = None
         self.report: dict[str, Any] = {
             "schema_version": 1 if config.expected_world_size == 1 else 2,
             "status": "pending",
@@ -241,6 +382,22 @@ class ValidationMeasurements(TrainerCallback):
                 "excludes dataset preparation, batch prefetch, logging, eval and export"
             ),
             "steps": [],
+        }
+
+    def configure_checkpoint(self, step, contract, resume_path=None, manifest=None):
+        self.checkpoint_step = step
+        self.checkpoint_contract = contract
+        self.resume_path = resume_path
+        self.resume_manifest = manifest
+        if manifest is not None:
+            previous = manifest["measurements"]
+            self.report["steps"] = previous["steps"]
+            self.report["phases"] = previous["phases"]
+        self.report["checkpoint_validation"] = {
+            "checkpoint_step": step, "total_max_steps": self.config.expected_steps,
+            "phase": "resumed" if manifest is not None else "initial", "resume_from_checkpoint": resume_path,
+            "start_global_step": step if manifest is not None else 0,
+            "rng_restored": False,
         }
 
     def persist(self) -> None:
@@ -290,18 +447,40 @@ class ValidationMeasurements(TrainerCallback):
             self.report["collective_proof"] = nccl_collective_proof(self.config)
         self.report["runtime"] = proof
         self.report["engine_global_steps_start"] = self.trainer.model_wrapped.global_steps
+        start_step = self.checkpoint_step if self.resume_manifest is not None else 0
         collective_check(
-            "Bounded validation must start at step zero, not resume"
-            if state.global_step != 0 or self.trainer.model_wrapped.global_steps != 0
+            f"Bounded validation Trainer/engine must start at expected step {start_step} without skipped updates"
+            if state.global_step != start_step or self.trainer.model_wrapped.global_steps != start_step
             or (self.config.expected_world_size == 8 and self.trainer.model_wrapped.skipped_steps != 0)
             else None,
             self.config, "start",
         )
+        if self.resume_manifest is not None:
+            def verify_restored():
+                saved = json.loads((Path(self.resume_path) / f"checkpoint_rank{args.process_index}.json").read_text())
+                actual = checkpoint_state_proof(self.trainer)
+                if actual != saved["state"]:
+                    raise RuntimeError("Restored model/AdamW/scheduler state hashes do not match saved rank state")
+                self.report["checkpoint_validation"]["restored_state"] = actual
+                self.report["checkpoint_validation"]["checkpoint_manifest_sha256"] = file_sha256(
+                    Path(self.resume_path) / "bounded_checkpoint.json"
+                )
+            collective_action(verify_restored, self.config, "checkpoint state restore")
+            self.report["checkpoint_validation"]["restored_state_ranks"] = exchange({
+                "rank": args.process_index,
+                "state": self.report["checkpoint_validation"]["restored_state"],
+            }, self.config)
         self.report["status"] = "running"
         self.persist()
         self.training_started = time.perf_counter()
 
     def on_step_begin(self, args, state, control, **kwargs):
+        if self.resume_manifest is not None:
+            collective_check(
+                None if self.report["checkpoint_validation"]["rng_restored"]
+                else "Checkpoint RNG must be restored before resumed optimizer updates",
+                self.config, "RNG restore",
+            )
         collective_check(
             "Bounded validation exceeded the configured step cap"
             if state.global_step >= self.config.expected_steps else None,
@@ -388,6 +567,8 @@ class ValidationMeasurements(TrainerCallback):
             "engine_optimizer_updates": self.trainer.model_wrapped.global_steps - self.engine_step_start,
             "row_indices": [index for batch in self.pending for index in batch.get("row_indices", [])],
         }
+        if self.checkpoint_step is not None:
+            item["phase"] = "resumed" if self.resume_manifest is not None else "initial"
         if self.config.expected_world_size == 8:
             item["engine_skipped_steps"] = self.trainer.model_wrapped.skipped_steps
             item["engine_skipped_updates"] = item["engine_skipped_steps"] - self.engine_skipped_start
@@ -412,6 +593,21 @@ class ValidationMeasurements(TrainerCallback):
         self.persist()
         if errors:
             raise RuntimeError("; ".join(errors))
+        if self.checkpoint_step is not None and self.resume_manifest is None:
+            if state.global_step == self.checkpoint_step:
+                control.should_save = True
+                control.should_training_stop = True
+
+    def finish_checkpoint_phase(self, global_step: int, training_loss: float):
+        collective_check(
+            None if global_step == self.checkpoint_step and len(self.report["steps"]) == global_step
+            and math.isfinite(training_loss) and self.report["status"] == "checkpoint_saved"
+            else "Checkpoint phase did not save exactly the requested finite optimizer steps",
+            self.config, "checkpoint phase finish",
+        )
+        self.report["phase_training_loss"] = training_loss
+        self.report["global_step"] = global_step
+        self.persist()
 
     def aggregate_step(self, ranks, args):
         if sorted(r["rank"] for r in ranks) != list(range(self.config.expected_world_size)):
@@ -462,6 +658,24 @@ class ValidationMeasurements(TrainerCallback):
             "max_peak_allocated_bytes": max(s["peak_allocated_bytes"] for s in steps),
             "max_peak_reserved_bytes": max(s["peak_reserved_bytes"] for s in steps),
         })
+        if self.checkpoint_step is not None:
+            self.report["phases"].append({
+                "phase": "resumed", "start_global_step": self.checkpoint_step,
+                "end_global_step": global_step, "training_loss": self.report["training_loss"],
+                "training_wall_seconds": self.report["training_wall_seconds"],
+            })
+            self.report["throughput_scope"] = (
+                "sum of separately timed optimizer intervals across checkpoint-separated phases; "
+                "not a contiguous six-step baseline; excludes checkpoint save/hash/reload"
+            )
+            self.report["training_loss_scope"] = "resumed phase only, not the combined eight-update loss"
+            self.report["training_wall_seconds_scope"] = (
+                "resumed callback wall time including dataloader skip/RNG restore; "
+                "excludes model reload/pre-start hashing and checkpoint save"
+            )
+            self.report["phase_training_wall_seconds_sum"] = sum(
+                phase["training_wall_seconds"] for phase in self.report["phases"]
+            )
         self.persist()
 
     def fail(self, exc: Exception) -> None:
@@ -476,6 +690,86 @@ class BoundedValidationTrainer(Trainer):
         super().__init__(*args, **kwargs)
         measurements.trainer = self
         self.add_callback(measurements)
+
+    def _save_rng_state(self, output_dir):
+        super()._save_rng_state(output_dir)
+        if self.measurements.checkpoint_step is not None:
+            self._saved_rng_sha256 = rng_sha256()
+
+    def _load_rng_state(self, checkpoint):
+        if self.measurements.resume_manifest is None:
+            return super()._load_rng_state(checkpoint)
+
+        def restore():
+            super(BoundedValidationTrainer, self)._load_rng_state(checkpoint)
+            saved = json.loads((Path(checkpoint) / f"checkpoint_rank{self.args.process_index}.json").read_text())
+            actual = rng_sha256()
+            if actual != saved["rng_sha256"]:
+                raise RuntimeError("Restored rank RNG state differs from checkpoint RNG fingerprint")
+            self.measurements.report["checkpoint_validation"].update({
+                "rng_restored": True, "rng_sha256": actual,
+            })
+        collective_action(restore, self.measurements.config, "rank RNG restore")
+        self.measurements.report["checkpoint_validation"]["rng_restored_ranks"] = exchange({
+            "rank": self.args.process_index,
+            "rng_sha256": self.measurements.report["checkpoint_validation"]["rng_sha256"],
+        }, self.measurements.config)
+
+    def _save_checkpoint(self, model, trial):
+        measurements = self.measurements
+        if measurements.checkpoint_step is None:
+            return super()._save_checkpoint(model, trial)
+        if self.state.global_step != measurements.checkpoint_step or measurements.resume_manifest is not None:
+            raise RuntimeError("Unexpected bounded validation checkpoint save")
+        if (
+            self.args.save_only_model or self.args.ignore_data_skip
+            or self.args.max_steps != measurements.config.expected_steps
+        ):
+            raise RuntimeError("Checkpoint validation requires full optimizer/RNG state, exact total horizon and data skip")
+        # Native HF calls DS save_checkpoint on all ranks and saves scheduler/RNG/Trainer state.
+        phase_wall_seconds = max(exchange(
+            time.perf_counter() - measurements.training_started, measurements.config,
+        ))
+        collective_action(
+            lambda: super(BoundedValidationTrainer, self)._save_checkpoint(model, trial),
+            measurements.config, "native full training checkpoint",
+        )
+        path = Path(self.args.output_dir) / f"checkpoint-{self.state.global_step}"
+
+        def save_rank_proof():
+            self._checkpoint_rank_state = {
+                "rank": self.args.process_index, "state": checkpoint_state_proof(self),
+                "rng_sha256": self._saved_rng_sha256,
+            }
+            atomic_json(path / f"checkpoint_rank{self.args.process_index}.json", self._checkpoint_rank_state)
+        collective_action(save_rank_proof, measurements.config, "checkpoint rank-state proof")
+        measurements.report["checkpoint_validation"]["saved_state_ranks"] = exchange(
+            self._checkpoint_rank_state, measurements.config,
+        )
+        torch.distributed.barrier()
+        measurements.report["status"] = "checkpoint_saved"
+        measurements.report["global_step"] = self.state.global_step
+        measurements.report["phases"] = [{
+            "phase": "initial", "start_global_step": 0,
+            "end_global_step": self.state.global_step,
+            "training_wall_seconds": phase_wall_seconds,
+        }]
+        measurements.report["checkpoint_validation"]["checkpoint_path"] = str(path)
+
+        def save_manifest():
+            if self.is_world_process_zero():
+                atomic_json(path / "bounded_checkpoint.json", {
+                    "schema_version": 1, "checkpoint_step": self.state.global_step,
+                    "contract": measurements.checkpoint_contract,
+                    "files": checkpoint_inventory(path, measurements.config.expected_world_size, self.state.global_step),
+                    "measurements": measurements.report,
+                })
+        collective_action(save_manifest, measurements.config, "completed checkpoint manifest")
+        torch.distributed.barrier()
+        measurements.report["checkpoint_validation"]["checkpoint_manifest_sha256"] = file_sha256(
+            path / "bounded_checkpoint.json"
+        )
+        measurements.persist()
 
     def create_optimizer(self):
         result = super().create_optimizer()

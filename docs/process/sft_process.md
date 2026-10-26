@@ -305,6 +305,110 @@ Hard process death or a failure inside a collective still requires torchrun's
 process supervision and the outer job's hard timeout; no in-process error
 exchange can guarantee recovery from a dead peer.
 
+### Opt-in bounded full checkpoint/resume validation
+
+Final `save_model()` plus `save_state()` exports weights and Trainer metadata;
+it is **not** a resumable DeepSpeed optimizer checkpoint. For a two-phase
+validation within one orchestration-owned bounded job, add
+`validation_checkpoint_step: 4` to **both** rendered YAMLs. Keep
+`bounded_validation.expected_steps: 8` and `--max-steps 8` in both phases:
+the optimizer/scheduler horizon is eight total updates, not four initially
+followed by eight new updates. This opt-in supports world eight and at most
+eight total updates, with `warmup_steps < checkpoint_step < expected_steps`,
+`eval_strategy: no` and `save_strategy: no`. This validation uses native
+torch AdamW and the external HF scheduler; DeepSpeed `optimizer` and
+`scheduler` config blocks are rejected before model loading.
+
+Phase one uses `resume_from_checkpoint: null`. At exactly update four, the
+callback requests a native HF full checkpoint and stops. HF calls
+`DeepSpeedEngine.save_checkpoint` on every rank, saves the external HF
+`scheduler.pt`, rank-specific RNG state, `training_args.bin`, and
+`trainer_state.json` with `max_steps: 8`. The trainer writes
+`checkpoint-4/bounded_checkpoint.json` **only after** all native saves and
+rank-state proof writes complete collectively. The phase report becomes
+`checkpoint_saved`, `global_step: 4`; no final model/tokenizer/summary export
+is performed. A fresh phase refuses to overwrite an existing checkpoint.
+
+Phase two changes **only** `resume_from_checkpoint` to the explicit
+`<same output_dir>/checkpoint-4` path. `auto`, a different output directory,
+missing/incomplete checkpoints, changed configuration/data/packages, or a
+different total step horizon are rejected rather than treated as warmstarts.
+The exact contract covers every SFT config field except the resume path,
+the original model config, raw train/validation file SHA256s, tokenized train
+row/order fingerprint, DeepSpeed input config snapshot, package versions,
+and the three trainer Python source file SHA256s.
+Both phases must therefore retain the same base path/revision, output path,
+seed, sampler policy, batching, optimizer/scheduler and preprocessing settings.
+Contracts and completed-manifest hashes must agree across all ranks.
+Rank zero verifies the full checkpoint inventory/hash once before model load,
+avoiding eight redundant reads of every large optimizer shard; each rank
+then independently checks its actual restored state.
+
+The completion manifest contains `schema_version: 1`, `checkpoint_step`,
+`contract`, `files` (relative path to `{bytes, sha256}`), and `measurements`
+(the immutable first-phase report). Required artifacts include all eight
+`global_step4/zero_pp_rank_N_mp_rank_00_model_states.pt`,
+`global_step4/bf16_zero_pp_rank_N_mp_rank_00_optim_states.pt`,
+`rng_state_N.pth`, `checkpoint_rankN.json`, `latest`, scheduler/args/Trainer
+state. Inventory hashing covers all checkpoint files except the completion
+manifest itself. The DS `latest` tag and saved Trainer global step/horizon
+must match; deleting or changing an artifact fails preflight.
+
+`checkpoint_rankN.json` stores `{rank, state, rng_sha256}`. `state` contains
+`global_step`, `optimizer_partition_count`, `optimizer_steps`, and
+`model_sha256`, `optimizer_sha256`, `scheduler_sha256`. These are actual-state
+fingerprints, not just hashes of filenames: local BF16 parameter partitions
+and persistent buffers, FP32 master partitions and AdamW moments/group
+hyperparameters, and scheduler state respectively. Nonfinite tensor state
+is rejected. Per-rank RNG fingerprints cover Python, NumPy, torch CPU and
+CUDA generators. Hashing uses structured type/shape/dtype metadata and exact
+tensor bytes in bounded CPU chunks, preserving BF16 values without conversion.
+Fingerprinting and checkpoint I/O add explicit wall-time/memory overhead;
+they are outside optimizer-update timing and must fit the outer job budget.
+
+HF resumes via its strict DeepSpeed model load with optimizer/scheduler
+restoration enabled; the original total horizon is retained.
+Before resumed updates, the trainer requires actual engine/Trainer/AdamW
+partition/scheduler step counters equal four and saved/restored
+model/optimizer/scheduler hashes match. HF restores rank RNG after dataloader
+skip and before forward; that restored fingerprint must match too.
+`ignore_data_skip` is forced false. Sequential diagnostic sharding therefore
+continues at global rows 128..159 for update five, not rows 0..31 again.
+For opt-in shuffled checkpoint validation, Accelerate's seedable sampler with
+`data_seed: seed` reconstructs epoch order; ordinary non-opt-in full training
+retains its existing native shuffled sampler behavior.
+
+Reports add `checkpoint_validation` with `checkpoint_step`, `total_max_steps`,
+`phase` (`initial`/`resumed`), `resume_from_checkpoint`, `start_global_step`,
+and `rng_restored`. Phase one additionally records `checkpoint_path`,
+`checkpoint_manifest_sha256` and `saved_state_ranks` (rank/state/RNG proofs).
+Phase two records `checkpoint_manifest_sha256`, local `restored_state`,
+`restored_state_ranks` (rank/state), local `rng_sha256`, and
+`rng_restored_ranks` (rank/RNG hash). All rank arrays use global-rank order.
+Each optimizer-step entry is labeled `phase`; phase-two reports retain the
+original four entries and append only steps five through eight. `phases`
+records start/end global steps and each phase's maximum rank training wall
+time. `engine_global_steps_start` truthfully records zero in phase one and
+four in phase two; it does not pretend the resumed engine starts at zero.
+Throughput still uses updates three through eight, but
+`throughput_scope` explicitly marks checkpoint-separated intervals, **not
+a contiguous six-step baseline**. Final `training_loss` and
+`training_wall_seconds` describe the resumed phase only, with corresponding
+scope fields; `phase_training_wall_seconds_sum` adds the two training phases
+without claiming end-to-end checkpoint save/model reload time. Resumed
+callback wall time includes dataloader skipping and the deferred native RNG
+restore/fingerprint; model reload and state hashing before the train-begin
+callback completes are excluded.
+
+CPU regressions compare actual tiny hybrid Qwen3.5 uninterrupted training
+against native save/resume with fixed and shuffled order, requiring bitwise
+matching final model/AdamW state, scheduler state and exact dataloader row
+continuity. Mocked eight-rank tests cover full-shard inventories, incomplete/
+incompatible checkpoints, restored-state/RNG mismatch, total-step guards,
+phase stop/export behavior and carried telemetry. Neither establishes an
+actual eight-GPU DeepSpeed checkpoint/reload; that remains the bounded
+cloud validation owner's responsibility.
+
 ---
 
 How the Layer1-delta SFT model (`Qwen3-4B-Thinking-2507` → distilled on GPT-4o

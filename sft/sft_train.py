@@ -20,6 +20,7 @@ Smoke test on 1 GPU:
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import json
 import logging
 import math
@@ -45,7 +46,8 @@ from transformers import (
 if __package__:
     from .bounded_validation import (
         BoundedValidationConfig, BoundedValidationTrainer, ValidationMeasurements,
-        collective_action, collective_check,
+        collective_action, collective_check, exchange,
+        deepspeed_config_snapshot, file_sha256, state_sha256, validate_checkpoint,
     )
     from .training_utils import (
         configure_qwen35_text_training,
@@ -58,7 +60,8 @@ if __package__:
 else:
     from bounded_validation import (
         BoundedValidationConfig, BoundedValidationTrainer, ValidationMeasurements,
-        collective_action, collective_check,
+        collective_action, collective_check, exchange,
+        deepspeed_config_snapshot, file_sha256, state_sha256, validate_checkpoint,
     )
     from training_utils import (
         configure_qwen35_text_training,
@@ -135,6 +138,7 @@ class SFTConfig:
     model_revision: str | None = None
     bounded_validation: dict[str, Any] | None = None
     validation_fixed_order: bool = False
+    validation_checkpoint_step: int | None = None
 
     @classmethod
     def from_yaml(cls, path: str) -> "SFTConfig":
@@ -378,9 +382,30 @@ def main():
     if validation is not None:
         if (
             not cfg.deepspeed_config or args.debug or args.smoke_test
-            or args.max_steps != validation.expected_steps or cfg.resume_from_checkpoint
+            or args.max_steps != validation.expected_steps
+            or (cfg.resume_from_checkpoint and cfg.validation_checkpoint_step is None)
         ):
             raise ValueError("Bounded validation requires active DeepSpeed, exact --max-steps and no resume/debug")
+    if cfg.validation_checkpoint_step is not None:
+        if (
+            validation is None or validation.expected_world_size != 8
+            or validation.expected_steps > 8
+            or isinstance(cfg.validation_checkpoint_step, bool)
+            or not isinstance(cfg.validation_checkpoint_step, int)
+            or not validation.warmup_steps < cfg.validation_checkpoint_step < validation.expected_steps
+            or cfg.resume_from_checkpoint == "auto"
+            or cfg.eval_strategy != "no" or cfg.save_strategy != "no"
+        ):
+            raise ValueError(
+                "Checkpoint validation requires world8, total steps <= 8, warmup_steps < validation_checkpoint_step < expected_steps, "
+                "explicit resume path (not auto), eval_strategy/save_strategy: no"
+            )
+        expected_checkpoint = Path(cfg.output_dir) / f"checkpoint-{cfg.validation_checkpoint_step}"
+        if cfg.resume_from_checkpoint:
+            if Path(cfg.resume_from_checkpoint).resolve() != expected_checkpoint.resolve():
+                raise ValueError("Checkpoint validation must resume the explicit checkpoint in the same output directory")
+        elif expected_checkpoint.exists():
+            raise ValueError("Refusing to overwrite an existing bounded checkpoint")
     optimizer_args = {
         key: getattr(cfg, key) for key in ("optim", "adam_beta1", "adam_beta2", "adam_epsilon")
         if getattr(cfg, key) is not None
@@ -522,8 +547,15 @@ def main():
         logging_first_step=True,
         logging_nan_inf_filter=False,
         **optimizer_args,
+        **({
+            "ignore_data_skip": False, "data_seed": cfg.seed,
+            "accelerator_config": {"use_seedable_sampler": True},
+            "save_only_model": False,
+        } if cfg.validation_checkpoint_step is not None else {}),
     )
     logger.info("TrainingArguments built.")
+    checkpoint_contract = None
+    resume_manifest = None
     if validation is not None and validation.expected_world_size == 8:
         if training_args.world_size != 8:
             raise RuntimeError("Expected eight distributed ranks before model loading")
@@ -536,6 +568,46 @@ def main():
                 raise ValueError(
                     f"Eight-rank fixed-order validation requires exactly {expected_rows} usable rows without skips"
                 )
+    if cfg.validation_checkpoint_step is not None:
+        config_identity = dict(cfg.__dict__)
+        config_identity.pop("resume_from_checkpoint")
+        deepspeed_input = json.loads(Path(cfg.deepspeed_config).read_text())
+        if "optimizer" in deepspeed_input or "scheduler" in deepspeed_input:
+            raise ValueError("Checkpoint validation requires native torch AdamW and external HF scheduler, not DS config blocks")
+        checkpoint_contract = {
+            "config": config_identity, "max_steps": max_steps,
+            "model_config": model_config.to_dict(),
+            "tokenized_train_sha256": state_sha256(list(train_ds)),
+            "input_sha256": {
+                "train": file_sha256(Path(cfg.train_jsonl)), "val": file_sha256(Path(cfg.val_jsonl)),
+            },
+            "deepspeed_input": deepspeed_config_snapshot(deepspeed_input),
+            "packages": {
+                name: importlib.metadata.version(name)
+                for name in ("torch", "transformers", "accelerate", "deepspeed", "datasets", "tokenizers")
+            },
+            "trainer_code_sha256": {
+                name: file_sha256(Path(__file__).with_name(name))
+                for name in ("sft_train.py", "bounded_validation.py", "training_utils.py")
+            },
+        }
+        # JSON normalization also prevents tuple/list representation mismatches on reload.
+        checkpoint_contract = json.loads(json.dumps(checkpoint_contract, allow_nan=False))
+        if len(set(exchange(state_sha256(checkpoint_contract), validation))) != 1:
+            raise ValueError("Ranks disagree on the checkpoint training/data/configuration contract")
+        if cfg.resume_from_checkpoint:
+            def validate_resume():
+                nonlocal resume_manifest
+                resume_manifest = validate_checkpoint(
+                    Path(cfg.resume_from_checkpoint), checkpoint_contract, validation, cfg.validation_checkpoint_step,
+                    verify_files=training_args.process_index == 0,
+                )
+            collective_action(validate_resume, validation, "checkpoint preflight")
+            manifest_hashes = exchange(
+                file_sha256(Path(cfg.resume_from_checkpoint) / "bounded_checkpoint.json"), validation,
+            )
+            if len(set(manifest_hashes)) != 1:
+                raise ValueError("Ranks read different checkpoint completion manifests")
 
     # TrainingArguments retains HfTrainerDeepSpeedConfig's weakref before
     # from_pretrained checks it to enter deepspeed.zero.Init for ZeRO-3.
@@ -575,6 +647,11 @@ def main():
             },
             "validation_fixed_order": cfg.validation_fixed_order,
         })
+        if cfg.validation_checkpoint_step is not None:
+            measurements.configure_checkpoint(
+                cfg.validation_checkpoint_step, checkpoint_contract,
+                cfg.resume_from_checkpoint, resume_manifest,
+            )
 
     collator = DataCollatorForSFT(pad_token_id=tokenizer.pad_token_id)
 
@@ -612,6 +689,10 @@ def main():
     try:
         train_result = trainer.train(resume_from_checkpoint=resume)
         if measurements is not None:
+            if cfg.validation_checkpoint_step is not None and resume_manifest is None:
+                measurements.finish_checkpoint_phase(trainer.state.global_step, train_result.training_loss)
+                logger.info("Full checkpoint saved; final export deferred until explicit resume phase")
+                return
             measurements.finish(trainer.state.global_step, train_result.training_loss)
     except Exception as exc:
         if measurements is not None:
