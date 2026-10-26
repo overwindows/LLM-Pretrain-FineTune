@@ -1,4 +1,11 @@
+import hashlib
+import importlib.util
+import io
 import json
+import math
+import shutil
+import subprocess
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,13 +14,17 @@ from unittest.mock import Mock, patch
 
 import torch
 from transformers import Trainer
+from accelerate.utils import DeepSpeedPlugin
 
 from sft.bounded_validation import (
     BoundedValidationConfig,
     BoundedValidationTrainer,
     ValidationMeasurements,
     deepspeed_proof,
+    deepspeed_config_snapshot,
+    optimizer_hyperparameters,
 )
+from sft import bounded_validation
 from sft.sft_train import build_dataset
 from sft import sft_train
 from test_sft_training import CharacterTokenizer, record
@@ -45,6 +56,22 @@ class FakeEngine:
 
 
 class BoundedValidationTests(unittest.TestCase):
+    @staticmethod
+    def actual_plugin():
+        # Exact root stage-3 configuration; no DeepSpeed engine/GPU is created.
+        return DeepSpeedPlugin(hf_ds_config={
+            "zero_optimization": {
+                "stage": 3, "overlap_comm": True, "contiguous_gradients": True,
+                "reduce_bucket_size": "auto", "stage3_prefetch_bucket_size": "auto",
+                "stage3_param_persistence_threshold": "auto",
+                "gather_16bit_weights_on_model_save": True,
+            },
+            "bf16": {"enabled": "auto"},
+            "gradient_accumulation_steps": "auto", "gradient_clipping": "auto",
+            "train_batch_size": "auto", "train_micro_batch_size_per_gpu": "auto",
+            "wall_clock_breakdown": False,
+        }, zero3_init_flag=False)
+
     def config(self):
         return BoundedValidationConfig.parse({
             "expected_steps": 2, "warmup_steps": 1,
@@ -76,6 +103,145 @@ class BoundedValidationTests(unittest.TestCase):
                 BoundedValidationConfig.parse(settings)
         with self.assertRaises(TypeError):
             BoundedValidationConfig.parse({"unused": True})
+
+    def test_actual_accelerate_plugin_logging_sentinel_reproduces_failure(self):
+        plugin = self.actual_plugin()
+        raw = plugin.hf_ds_config.config
+        self.assertIs(raw, plugin.deepspeed_config)
+        self.assertIsInstance(raw["steps_per_print"], float)
+        self.assertEqual(raw["steps_per_print"], math.inf)
+        with self.assertRaisesRegex(ValueError, "Out of range float"):
+            json.dumps(raw, allow_nan=False)
+        proof = deepspeed_config_snapshot(raw)
+        encoded = proof["resolved_hf_deepspeed_config"]
+        self.assertEqual(encoded["steps_per_print"], {"__deepspeed_config_float__": "+Infinity"})
+        self.assertEqual(encoded["zero_optimization"], raw["zero_optimization"])
+        self.assertEqual(raw["steps_per_print"], math.inf)  # engine input is not mutated
+        canonical = json.dumps(encoded, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+        self.assertEqual(proof["resolved_hf_deepspeed_config_sha256"],
+                         hashlib.sha256(canonical.encode("ascii")).hexdigest())
+        self.assertEqual(proof, deepspeed_config_snapshot(dict(reversed(list(raw.items())))))
+        raw["zero_optimization"]["stage"] = 2
+        self.assertEqual(encoded["zero_optimization"]["stage"], 3)
+        self.assertNotEqual(proof["resolved_hf_deepspeed_config_sha256"],
+                            deepspeed_config_snapshot(raw)["resolved_hf_deepspeed_config_sha256"])
+
+    @unittest.skipUnless(importlib.util.find_spec("deepspeed"), "Optional real DeepSpeed package not installed")
+    def test_actual_deepspeed_config_accepts_plugin_logging_sentinel_on_cpu(self):
+        from deepspeed.runtime.config import DeepSpeedConfig
+
+        plugin = self.actual_plugin()
+        raw = plugin.hf_ds_config.config
+        raw.update({
+            "bf16": {"enabled": True}, "gradient_accumulation_steps": 4,
+            "gradient_clipping": 1.0, "train_batch_size": 4,
+            "train_micro_batch_size_per_gpu": 1,
+        })
+        raw["zero_optimization"].update({
+            "reduce_bucket_size": 1024, "stage3_prefetch_bucket_size": 900,
+            "stage3_param_persistence_threshold": 320,
+        })
+        # Only constructor rank queries are mocked: no process group/engine or updates.
+        with patch("deepspeed.comm.get_rank", return_value=0), patch(
+            "deepspeed.comm.get_world_size", return_value=1
+        ):
+            ds_config = DeepSpeedConfig(raw)
+        self.assertEqual(ds_config.steps_per_print, math.inf)
+        self.assertEqual(ds_config.zero_config.stage, 3)
+        self.assertEqual(ds_config.world_size, 1)
+        proof = deepspeed_config_snapshot(raw)
+        self.assertEqual(proof["resolved_hf_deepspeed_config"]["steps_per_print"],
+                         {"__deepspeed_config_float__": "+Infinity"})
+
+    def test_config_encoding_rejects_unverified_nested_infinities_nan_and_tag_collisions(self):
+        for value in (math.inf, -math.inf, math.nan):
+            for raw in (
+                {"nested": {"items": [value]}},
+                {"zero_optimization": {"reduce_bucket_size": value}},
+                {"gradient_clipping": value},
+            ):
+                with self.subTest(raw=raw), self.assertRaisesRegex(ValueError, "nonfinite DeepSpeed configuration"):
+                    deepspeed_config_snapshot(raw)
+        for value in (-math.inf, math.nan):
+            with self.assertRaisesRegex(ValueError, "steps_per_print"):
+                deepspeed_config_snapshot({"steps_per_print": value})
+        for raw in (
+            {"steps_per_print": {"__deepspeed_config_float__": "+Infinity"}},
+            {"nested": [{"__deepspeed_config_float__": "+Infinity"}]},
+        ):
+            with self.assertRaisesRegex(ValueError, "Reserved"):
+                deepspeed_config_snapshot(raw)
+        for value in (0, 1, 1000, "inf", None):
+            self.assertEqual(deepspeed_config_snapshot({"steps_per_print": value})[
+                "resolved_hf_deepspeed_config"]["steps_per_print"], value)
+
+    def check_proof_with_actual_plugin(self, module):
+        trainer = self.trainer()
+        trainer.accelerator.state.deepspeed_plugin = self.actual_plugin()
+        with patch.dict("sys.modules", {"deepspeed": SimpleNamespace(
+            DeepSpeedEngine=FakeEngine, __version__="0.16.9"
+        )}), patch("torch.distributed.is_initialized", return_value=True), patch(
+            "torch.distributed.get_world_size", return_value=1
+        ), patch("torch.distributed.get_rank", return_value=0), patch(
+            "torch.cuda.is_available", return_value=True
+        ), patch("torch.cuda.current_device", return_value=0), patch(
+            "torch.cuda.get_device_name", return_value="mock-device"
+        ), patch("importlib.metadata.version", return_value="mock-version"):
+            proof = module.deepspeed_proof(trainer, self.config())
+        with tempfile.TemporaryDirectory() as tmp:
+            measurements = module.ValidationMeasurements(self.config(), tmp)
+            measurements.report["runtime"] = proof
+            measurements.persist()
+            saved = json.loads(measurements.path.read_text())
+            self.assertEqual(saved["runtime"], proof)
+        self.assertEqual(proof["resolved_hf_deepspeed_config"]["steps_per_print"],
+                         {"__deepspeed_config_float__": "+Infinity"})
+        self.assertEqual(proof["resolved_hf_deepspeed_config_encoding"],
+                         "accelerate-steps-per-print-positive-infinity-v1")
+
+    def test_runtime_proof_with_actual_plugin_persists_strict_json(self):
+        self.check_proof_with_actual_plugin(bounded_validation)
+
+    @unittest.skipUnless(shutil.which("git"), "Git archive required")
+    def test_committed_archive_runtime_proof_with_actual_plugin(self):
+        root = Path(__file__).resolve().parents[2]
+        raw = subprocess.check_output([
+            "git", "-c", "core.autocrlf=false", "-c", "core.eol=lf",
+            "archive", "--format=tar", "HEAD", "sft/bounded_validation.py",
+        ], cwd=root, timeout=30)
+        with tempfile.TemporaryDirectory() as tmp, tarfile.open(fileobj=io.BytesIO(raw)) as archive:
+            source = archive.extractfile("sft/bounded_validation.py").read()
+            blob = subprocess.check_output(["git", "show", "HEAD:sft/bounded_validation.py"], cwd=root, timeout=30)
+            self.assertEqual(source, blob)
+            path = Path(tmp) / "bounded_validation.py"
+            path.write_bytes(source)
+            spec = importlib.util.spec_from_file_location("archived_bounded_validation", path)
+            module = importlib.util.module_from_spec(spec)
+            with patch.dict("sys.modules", {spec.name: module}):
+                spec.loader.exec_module(module)
+                self.check_proof_with_actual_plugin(module)
+
+    def test_config_sentinel_does_not_relax_measurement_or_optimizer_finiteness(self):
+        for value in (math.inf, -math.inf, math.nan):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as tmp:
+                observer = ValidationMeasurements(self.config(), tmp)
+                observer.report.update(deepspeed_config_snapshot({"steps_per_print": math.inf}))
+                observer.report["steps"] = [{"elapsed_seconds": value}]
+                with self.assertRaises(ValueError):
+                    observer.persist()
+                observer.started = 0
+                observer.pending = [{}]
+                with self.assertRaisesRegex(RuntimeError, "Nonfinite"):
+                    observer.record_loss(torch.tensor(value))
+                with self.assertRaises(ValueError):
+                    optimizer_hyperparameters(SimpleNamespace(param_groups=[{"lr": value}]))
+                observer.report["steps"] = []
+                observer.pending = [{"input_lengths": [1]}]
+                with patch("torch.cuda.synchronize"), patch(
+                    "sft.bounded_validation.time.perf_counter", return_value=value
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "Missing or invalid bounded optimizer-step measurements"):
+                        observer.on_step_end(self.trainer().args, SimpleNamespace(global_step=1), None)
 
     def test_runtime_proof_checks_actual_engine_and_parallel_settings(self):
         trainer = self.trainer()

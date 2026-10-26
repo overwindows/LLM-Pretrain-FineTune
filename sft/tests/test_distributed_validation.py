@@ -40,6 +40,8 @@ def topology():
         "rank": rank, "local_rank": rank, "hostname": "one-host",
         "cuda_device": "NVIDIA A100-SXM4-80GB", "cuda_uuid": f"uuid-{rank}",
         "distributed_backend": "nccl", "resolved_hf_deepspeed_config": {"stage": 3},
+        "resolved_hf_deepspeed_config_encoding": "accelerate-steps-per-print-positive-infinity-v1",
+        "resolved_hf_deepspeed_config_sha256": "mock-hash",
         "packages": {"deepspeed": "0.16.9"}, "torch_version": "2.6.0+cu124",
         "zero_stage": 3, "bf16_enabled": True, "gradient_accumulation_steps": 2,
         "micro_batch_size": 2, "train_batch_size": 32, "cuda_device_index": rank,
@@ -82,6 +84,7 @@ class DistributedValidationTests(unittest.TestCase):
             ("cuda_device", "NVIDIA T4"), ("distributed_backend", "gloo"),
             ("cuda_device", "NVIDIA A100 MIG 1g.10gb"),
             ("train_batch_size", 4), ("bf16_enabled", False),
+            ("resolved_hf_deepspeed_config_sha256", "different-hash"),
         ):
             ranks = topology()
             ranks[7][key] = value

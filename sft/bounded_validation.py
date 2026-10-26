@@ -1,6 +1,7 @@
 """Opt-in bounded DeepSpeed validation evidence; not a general profiler."""
 from __future__ import annotations
 
+import hashlib
 import importlib.metadata
 import json
 import math
@@ -74,6 +75,36 @@ def optimizer_hyperparameters(optimizer) -> list[dict[str, Any]]:
     ], allow_nan=False))
 
 
+def deepspeed_config_snapshot(config: dict[str, Any]) -> dict[str, Any]:
+    """Encode only Accelerate's verified logging sentinel, never measurements."""
+    tag = "__deepspeed_config_float__"
+
+    def encode(value, path):
+        if isinstance(value, dict):
+            if tag in value:
+                raise ValueError(f"Reserved DeepSpeed configuration tag at {path!r}")
+            if any(not isinstance(key, str) for key in value):
+                raise ValueError(f"DeepSpeed configuration keys must be strings at {path!r}")
+            return {key: encode(item, path + (key,)) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [encode(item, path + (index,)) for index, item in enumerate(value)]
+        if isinstance(value, float) and not math.isfinite(value):
+            if path == ("steps_per_print",) and value == math.inf:
+                return {tag: "+Infinity"}
+            raise ValueError(f"Unexpected nonfinite DeepSpeed configuration at {path!r}: {value!r}")
+        return value
+
+    encoded = encode(config, ())
+    canonical = json.dumps(
+        encoded, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False,
+    )
+    return {
+        "resolved_hf_deepspeed_config": json.loads(canonical),
+        "resolved_hf_deepspeed_config_encoding": "accelerate-steps-per-print-positive-infinity-v1",
+        "resolved_hf_deepspeed_config_sha256": hashlib.sha256(canonical.encode("ascii")).hexdigest(),
+    }
+
+
 def validate_topology(ranks: list[dict[str, Any]], expected_world_size: int) -> None:
     if len(ranks) != expected_world_size or sorted(r["rank"] for r in ranks) != list(range(expected_world_size)):
         raise RuntimeError("Runtime proof does not contain exactly the expected ranks")
@@ -91,6 +122,7 @@ def validate_topology(ranks: list[dict[str, Any]], expected_world_size: int) -> 
         for rank in ranks:
             for key in (
                 "resolved_hf_deepspeed_config", "packages", "torch_version",
+                "resolved_hf_deepspeed_config_encoding", "resolved_hf_deepspeed_config_sha256",
                 "zero_stage", "bf16_enabled", "gradient_accumulation_steps",
                 "micro_batch_size", "train_batch_size", "optimizer_name",
                 "optimizer_class", "optimizer_group_proof", "underlying_optimizer_groups",
@@ -146,7 +178,7 @@ def deepspeed_proof(trainer, config: BoundedValidationConfig) -> dict[str, Any]:
     # This public HF/Accelerate config is finalized before engine preparation.
     # It records resolved input values, not every engine-internal default.
     resolved_config = trainer.accelerator.state.deepspeed_plugin.hf_ds_config.config
-    resolved_config = json.loads(json.dumps(resolved_config, allow_nan=False))
+    config_proof = deepspeed_config_snapshot(resolved_config)
     proof = {
         "engine_class": f"{type(engine).__module__}.{type(engine).__name__}",
         "zero_stage": stage,
@@ -157,7 +189,7 @@ def deepspeed_proof(trainer, config: BoundedValidationConfig) -> dict[str, Any]:
         "micro_batch_size": engine.train_micro_batch_size_per_gpu(),
         "train_batch_size": engine.train_batch_size(),
         "bf16_enabled": bool(engine.bfloat16_enabled()),
-        "resolved_hf_deepspeed_config": resolved_config,
+        **config_proof,
         "engine_optimizer_class": f"{type(engine.optimizer).__module__}.{type(engine.optimizer).__name__}",
         "optimizer_name": engine.optimizer_name(),
         "deepspeed_version": deepspeed.__version__,

@@ -201,6 +201,41 @@ its optimizer wrapper class and optimizer name, and snapshots
 automatic bucket/batch resolution. That snapshot represents the finalized
 configuration passed to DeepSpeed, not all of DeepSpeed's internal defaults.
 
+The resolved HF config includes Accelerate 1.15's deliberate
+`steps_per_print = float("inf")` sentinel to disable DeepSpeed stdout logging
+([upstream `DeepSpeedPlugin.__post_init__`](https://github.com/huggingface/accelerate/blob/v1.15.0/src/accelerate/utils/dataclasses.py)).
+It shares the `hf_ds_config.config` dictionary; this is not a nonfinite loss
+or a source-JSON setting. DeepSpeed 0.16.9 accepts this sentinel in its actual
+CPU configuration constructor. A strict JSON snapshot previously failed here,
+before runtime proof persistence or any optimizer update.
+
+Runtime proof now uses a narrow, lossless JSON representation **only** at
+`$.steps_per_print`: a positive float infinity becomes
+`{"__deepspeed_config_float__": "+Infinity"}`. Decode that exact tag at that
+exact path as positive float infinity, not a string/zero/null. Finite values
+and all other fields retain their existing JSON representation. The raw
+HF/engine configuration is never mutated. Any negative infinity, NaN, or
+infinity elsewhere (including nested buckets) is rejected with its path,
+as is the reserved `__deepspeed_config_float__` key anywhere in raw config,
+so a user-provided object cannot impersonate the sentinel.
+
+Every runtime/rank proof also records:
+`resolved_hf_deepspeed_config_encoding =
+"accelerate-steps-per-print-positive-infinity-v1"` and
+`resolved_hf_deepspeed_config_sha256`. The hash is SHA256 over the **encoded**
+config dictionary serialized with Python
+`json.dumps(config, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+allow_nan=False).encode("ascii")`, not a hash of the descriptor or full proof.
+Verifiers must validate the descriptor/tag path and all remaining finite
+config guards, recompute this hash, and compare both snapshot and hash across
+ranks. The descriptor is included even for fully finite configs. Ordinary
+losses, timings, optimizer hyperparameters and report persistence remain
+strictly finite; this encoding is never applied to those measurements.
+Regressions reproduce the original failure using the actual Accelerate
+plugin and exercise the proof/persistence path imported from the exact
+committed Git archive. The optional real-DeepSpeed test checks only its CPU
+config constructor, not a distributed engine or GPU compatibility.
+
 Eight-rank reports use `schema_version: 2`; one-rank reports retain version 1.
 Every rank writes only `bounded_validation.rankN.json`; only rank zero also
 writes the aggregate filename and final training summary. `runtime.ranks`
