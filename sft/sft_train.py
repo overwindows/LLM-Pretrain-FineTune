@@ -827,7 +827,10 @@ def main():
         train_result = trainer.train(resume_from_checkpoint=resume)
         if full_measurements is not None:
             full_measurements.finish(trainer.state.global_step, train_result.training_loss)
-            if not full_measurements.report["corpus_complete"]:
+            if (
+                not full_measurements.report["corpus_complete"]
+                and not full_corpus.value["export_at_segment_end"]
+            ):
                 logger.info("Full-state segment saved; corpus incomplete, final export deferred")
                 return
         if measurements is not None:
@@ -882,7 +885,11 @@ def main():
                     f, indent=2,
                 )
 
-    logger.info("Saving final model to %s", cfg.output_dir)
+    logger.info(
+        "Saving %s model to %s",
+        "segment" if full_measurements is not None and not full_measurements.report["corpus_complete"] else "final",
+        cfg.output_dir,
+    )
     try:
         if distributed_validation:
             export_collectives = COLLECTIVES if full_measurements is not None else validation
@@ -891,7 +898,13 @@ def main():
             collective_action(save_weights, export_collectives, "full model export")
             torch.distributed.barrier()
             collective_action(save_tokenizer, export_collectives, "rank-zero tokenizer export")
-            export_measurements.report["export_complete"] = True
+            if full_measurements is not None:
+                full_measurements.record_export()
+                export_measurements.report["segment_export_complete"] = True
+                if full_measurements.report["corpus_complete"]:
+                    export_measurements.report["export_complete"] = True
+            else:
+                export_measurements.report["export_complete"] = True
             export_measurements.persist()
             collective_action(save_summary, export_collectives, "rank-zero final summary")
             torch.distributed.barrier()

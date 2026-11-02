@@ -111,10 +111,12 @@ class FullCorpusContract:
         exact_keys(value, {
             "schema_version", "model", "input_files", "artifacts", "source_counts", "frequencies",
             "exposure_counts", "full_passes", "total_max_steps", "segment_end_steps",
-            "training", "sampler", "quality_train",
+            "training", "sampler", "quality_train", "export_at_segment_end",
         }, "full-corpus contract")
         if type(value["schema_version"]) is not int or value["schema_version"] != 1 or value["quality_train"] is not False:
             raise ValueError("Full-corpus contract must be schema1 with Quality evaluation-only")
+        if not isinstance(value["export_at_segment_end"], bool):
+            raise ValueError("export_at_segment_end must be an explicit boolean")
         exact_keys(value["model"], {"base_model", "revision"}, "model")
         if value["model"] != {"base_model": cfg.base_model, "revision": cfg.model_revision}:
             raise ValueError("Model path/revision differs from full-corpus contract")
@@ -326,6 +328,8 @@ class CoverageCursor:
         self.contract = contract
         self.step = 0
         self.digests = [hashlib.sha256() for _ in range(8)]
+        self.task_exposures = Counter()
+        self.task_sources = {task: set() for task in FREQUENCIES}
 
     def advance(self, item):
         step = self.step + 1
@@ -353,8 +357,21 @@ class CoverageCursor:
                 for loss in evidence["losses"]
             ) or len(evidence["losses"]) != 4:
                 raise ValueError("Coverage requires four finite microbatch losses per rank")
-            self.digests[rank].update(json.dumps({"step": step, "indices": indices}, separators=(",", ":")).encode("ascii"))
+        for rank in range(8):
+            self.digests[rank].update(json.dumps(
+                {"step": step, "indices": expected[rank::8]}, separators=(",", ":"),
+            ).encode("ascii"))
+        for index in expected:
+            row = self.contract.rows[index]
+            self.task_exposures[row["task"]] += 1
+            self.task_sources[row["task"]].add(row["source_id"])
         self.step = step
+
+    def consumed_counts(self):
+        return {
+            "source_counts": {task: len(sources) for task, sources in self.task_sources.items()},
+            "exposure_counts": {task: self.task_exposures[task] for task in FREQUENCIES},
+        }
 
     def rank_state(self, rank):
         completed, partial = divmod(self.step, self.contract.steps_per_pass)
@@ -381,12 +398,13 @@ def full_inventory(path, step):
     return inventory
 
 
-def validate_full_checkpoint(path, runtime_contract, contract, verify_files=True):
+def validate_full_checkpoint(path, runtime_contract, contract, verify_files=True, for_resume=True):
     manifest = strict_json(Path(path) / "full_corpus_checkpoint.json")
     step = manifest["checkpoint_step"]
     if (
         manifest["schema_version"] != 1 or manifest["runtime_contract"] != runtime_contract
-        or step not in contract.value["segment_end_steps"] or step >= contract.value["total_max_steps"]
+        or step not in contract.value["segment_end_steps"]
+        or for_resume and step >= contract.value["total_max_steps"]
     ):
         raise ValueError("Incompatible full-corpus checkpoint/unchanged scheduler horizon")
     if verify_files and full_inventory(Path(path), step) != manifest["files"]:
@@ -400,6 +418,111 @@ def validate_full_checkpoint(path, runtime_contract, contract, verify_files=True
         if proof["rank"] != rank or proof["coverage"] != cursor.rank_state(rank):
             raise ValueError("Saved rank coverage cursor does not match completed-update journal")
     return manifest
+
+
+def segment_export_inventory(path):
+    path = Path(path)
+    files = [
+        file for file in path.rglob("*") if file.is_file() and (
+            file.parent == path and (
+                file.name in {"config.json", "generation_config.json", "model.safetensors.index.json"}
+                or file.name.startswith("tokenizer") or file.name in {"special_tokens_map.json", "added_tokens.json", "chat_template.jinja"}
+                or file.suffix == ".safetensors"
+            ) or file.parent.name == "chat_templates" and file.suffix == ".jinja"
+        )
+    ]
+    names = {file.relative_to(path).as_posix() for file in files}
+    if not {"config.json", "generation_config.json", "tokenizer.json", "tokenizer_config.json"}.issubset(names):
+        raise ValueError("Missing native HF segment export model/generation/tokenizer files")
+    if not any(name.endswith(".safetensors") for name in names) or not any(name.endswith(".jinja") for name in names):
+        raise ValueError("Missing native HF segment export weights/chat template")
+    return {file.relative_to(path).as_posix(): {
+        "bytes": file.stat().st_size, "sha256": file_sha256(file),
+    } for file in sorted(files)}
+
+
+def verify_full_segment(output_dir, contract, expected_runtime_contract=None):
+    """Read-only raw-file and completed-ID verifier, not GPU-state reconstruction."""
+    directory = Path(output_dir)
+    report = strict_json(directory / "full_corpus.json")
+    step = report["global_step"]
+    if type(step) is not int or step not in contract.value["segment_end_steps"]:
+        raise ValueError("Segment report has an uncontracted optimizer boundary")
+    checkpoint = directory / f"checkpoint-{step}"
+    marker = strict_json(checkpoint / "full_corpus_checkpoint.json")
+    runtime = marker["runtime_contract"]
+    if runtime.get("corpus") != contract.value or (
+        expected_runtime_contract is not None and runtime != expected_runtime_contract
+    ):
+        raise ValueError("Segment runtime/corpus contract differs from the audited expectation")
+    validate_full_checkpoint(checkpoint, runtime, contract, for_resume=False)
+    if (
+        report["contract_sha256"] != contract_sha256(contract.value)
+        or report["runtime_contract_sha256"] != contract_sha256(runtime)
+        or report["checkpoint_manifest_sha256"] != file_sha256(checkpoint / "full_corpus_checkpoint.json")
+        or report["segment_end_step"] != step or report["total_max_steps"] != contract.value["total_max_steps"]
+    ):
+        raise ValueError("Segment report contract/checkpoint/horizon identity mismatch")
+    complete = step == contract.value["total_max_steps"]
+    position = contract.value["segment_end_steps"].index(step)
+    expected_start = contract.value["segment_end_steps"][position - 1] if position else 0
+    if (
+        report["corpus_complete"] is not complete
+        or report["status"] != ("corpus_complete" if complete else "segment_complete")
+        or report["start_global_step"] != expected_start
+        or report["completed_full_passes"] != step // contract.steps_per_pass
+    ):
+        raise ValueError("Incomplete/full-corpus completion flags do not match actual horizon")
+    cursor = CoverageCursor(contract)
+    cursor.restore_journal(checkpoint / "coverage.jsonl", step)
+    if report["consumed_counts"] != cursor.consumed_counts():
+        raise ValueError("Reported source/task exposure counts differ from actual completed-update replay")
+    coverage = [cursor.rank_state(rank) for rank in range(8)]
+    saved = [strict_json(checkpoint / f"checkpoint_rank{rank}.json") for rank in range(8)]
+    if report["coverage_ranks"] != coverage or report["saved_state_ranks"] != saved or marker["saved_state_ranks"] != saved:
+        raise ValueError("Report rank state/coverage hashes do not match the immutable checkpoint")
+    for rank, proof in enumerate(saved):
+        state = proof["state"]
+        if (
+            proof["rank"] != rank or state["global_step"] != step
+            or state["optimizer_partition_count"] != len(state["optimizer_steps"])
+            or not state["optimizer_steps"] or any(type(value) is not int or value != step for value in state["optimizer_steps"])
+            or any(not SHA256.fullmatch(state[key]) for key in ("model_sha256", "optimizer_sha256", "scheduler_sha256"))
+            or not SHA256.fullmatch(proof["rng_sha256"])
+        ):
+            raise ValueError("Missing/inconsistent saved actual rank-state fingerprints/counters")
+        rank_report = strict_json(directory / f"full_corpus.rank{rank}.json")
+        for key in (
+            "status", "contract_sha256", "runtime_contract_sha256", "global_step", "corpus_complete",
+            "checkpoint_manifest_sha256", "coverage_ranks", "saved_state_ranks", "consumed_counts",
+        ):
+            if rank_report[key] != report[key]:
+                raise ValueError(f"Rank {rank} segment report differs on {key}")
+    if complete:
+        if (
+            report["full_pass_source_counts"] != contract.value["source_counts"]
+            or report["full_pass_exposure_counts"] != contract.value["exposure_counts"]
+            or report["total_completed_exposures"] != contract.size * contract.value["full_passes"]
+        ):
+            raise ValueError("Final source/exposure counts differ from exact replayed full passes")
+    if complete or contract.value["export_at_segment_end"]:
+        if complete and report.get("export_complete") is not True:
+            raise ValueError("Final native HF export did not complete")
+        if report.get("segment_export_complete") is not True:
+            raise ValueError("Requested native segment export did not complete")
+        if report["segment_export_files"] != segment_export_inventory(directory):
+            raise ValueError("Native HF segment export file inventory/hash mismatch")
+        for rank in range(8):
+            rank_report = strict_json(directory / f"full_corpus.rank{rank}.json")
+            if rank_report.get("segment_export_files") != report["segment_export_files"] or rank_report.get("segment_export_complete") is not True:
+                raise ValueError("Rank reports disagree on native export hashes/completion")
+    return {
+        "global_step": step, "corpus_complete": complete, "coverage_ranks": coverage,
+        "completed_exposures": step * contract.global_batch,
+        "consumed_counts": cursor.consumed_counts(),
+        "checkpoint_manifest_sha256": report["checkpoint_manifest_sha256"],
+        "segment_export_files": report.get("segment_export_files"),
+    }
 
 
 class FullCorpusMeasurements(TrainerCallback):
@@ -545,12 +668,23 @@ class FullCorpusMeasurements(TrainerCallback):
             or self.report["status"] != "checkpoint_saved" else None, COLLECTIVES, "full-corpus segment finish",
         )
         complete = step == self.contract.value["total_max_steps"]
+        if complete:
+            counts = self.cursor.consumed_counts()
+            if (
+                counts["source_counts"] != self.contract.value["source_counts"]
+                or counts["exposure_counts"] != {
+                    task: count * self.contract.value["full_passes"]
+                    for task, count in self.contract.value["exposure_counts"].items()
+                }
+            ):
+                raise RuntimeError("Actual completed-update full-corpus counts differ from the exact contract")
         self.report.update({
             "status": "corpus_complete" if complete else "segment_complete",
             "corpus_complete": complete, "global_step": step,
             "completed_full_passes": step // self.contract.steps_per_pass,
             "segment_training_loss": loss, "training_loss_scope": "this process segment only",
             "coverage_ranks": exchange(self.cursor.rank_state(self.trainer.args.process_index), COLLECTIVES),
+            "consumed_counts": self.cursor.consumed_counts(),
         })
         if complete:
             self.report["full_pass_source_counts"] = self.contract.value["source_counts"]
@@ -561,6 +695,18 @@ class FullCorpusMeasurements(TrainerCallback):
     def fail(self, exc):
         self.report.update({"status": "failed", "corpus_complete": False, "error": f"{type(exc).__name__}: {exc}"})
         self.persist()
+
+    def record_export(self):
+        inventory = None
+        def inspect():
+            nonlocal inventory
+            if self.trainer.is_world_process_zero():
+                inventory = segment_export_inventory(self.output_dir)
+        collective_action(inspect, COLLECTIVES, "native HF segment export file hashes")
+        inventories = exchange(inventory, COLLECTIVES)
+        if not inventories[0] or any(value is not None for value in inventories[1:]):
+            raise RuntimeError("Native export inventory must be produced by global rank zero only")
+        self.report["segment_export_files"] = inventories[0]
 
 
 class FullCorpusTrainer(Trainer):

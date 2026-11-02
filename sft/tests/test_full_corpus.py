@@ -98,6 +98,7 @@ def fixture(directory, passes=2):
             for epoch in range(passes)
         ]},
         "quality_train": False,
+        "export_at_segment_end": False,
     }
     value["training"]["world_size"] = 8
     atomic_json(Path(cfg.full_corpus_contract), value)
@@ -194,6 +195,7 @@ class FullCorpusContractTests(unittest.TestCase):
             variants = []
             for key, replacement in (
                 ("quality_train", True), ("total_max_steps", 3), ("full_passes", True),
+                ("export_at_segment_end", "true"),
                 ("segment_end_steps", [2, 1, 4]), ("frequencies", {"gem": 1, "hpf": 1, "mai_profile": 1}),
             ):
                 variants.append({**original, key: replacement})
@@ -313,6 +315,83 @@ class FullCorpusContractTests(unittest.TestCase):
             (path / "rng_state_7.pth").unlink()
             with self.assertRaisesRegex(ValueError, "rng_state_7"):
                 fc.validate_full_checkpoint(path, runtime, contract)
+
+    def test_read_only_downloaded_segment_verifier_recomputes_counts_rank_hashes_and_hf_export(self):
+        for step in (1, 2):
+            with self.subTest(step=step), tempfile.TemporaryDirectory() as tmp:
+                cfg, value = fixture(tmp, passes=1)
+                value["export_at_segment_end"] = True
+                atomic_json(Path(cfg.full_corpus_contract), value)
+                contract = fc.FullCorpusContract(cfg.full_corpus_contract, cfg)
+                output = Path(cfg.output_dir)
+                path = output / f"checkpoint-{step}"
+                test_checkpoint_validation.checkpoint_files(path, step=step)
+                atomic_json(path / "trainer_state.json", {"global_step": step, "max_steps": 2})
+                cursor = fc.CoverageCursor(contract)
+                journal = []
+                for update in range(1, step + 1):
+                    item = evidence(contract, update)
+                    cursor.advance(item)
+                    journal.append(json.dumps(item) + "\n")
+                (path / "coverage.jsonl").write_text("".join(journal))
+                saved = []
+                for rank in range(8):
+                    proof = {
+                        "rank": rank, "rng_sha256": "0" * 64, "coverage": cursor.rank_state(rank),
+                        "state": {
+                            "global_step": step, "optimizer_partition_count": 1, "optimizer_steps": [step],
+                            "model_sha256": "0" * 64, "optimizer_sha256": "1" * 64, "scheduler_sha256": "2" * 64,
+                        },
+                    }
+                    saved.append(proof)
+                    atomic_json(path / f"checkpoint_rank{rank}.json", proof)
+                runtime = {"corpus": contract.value, "scope": "fixture-not-GPU-runtime"}
+                marker = {
+                    "schema_version": 1, "checkpoint_step": step, "runtime_contract": runtime,
+                    "files": fc.full_inventory(path, step), "saved_state_ranks": saved,
+                }
+                atomic_json(path / "full_corpus_checkpoint.json", marker)
+                for name in ("config.json", "generation_config.json", "tokenizer.json", "tokenizer_config.json"):
+                    atomic_json(output / name, {"scope": "fixture"})
+                (output / "chat_template.jinja").write_text("fixture")
+                (output / "model.safetensors").write_bytes(b"fixture-not-loadable-model")
+                complete = step == 2
+                report = {
+                    "schema_version": 1, "status": "corpus_complete" if complete else "segment_complete",
+                    "corpus_complete": complete, "global_step": step, "segment_end_step": step,
+                    "start_global_step": step - 1, "completed_full_passes": int(complete), "total_max_steps": 2,
+                    "contract_sha256": fc.contract_sha256(contract.value),
+                    "runtime_contract_sha256": fc.contract_sha256(runtime),
+                    "checkpoint_manifest_sha256": file_sha256(path / "full_corpus_checkpoint.json"),
+                    "coverage_ranks": [cursor.rank_state(rank) for rank in range(8)],
+                    "consumed_counts": cursor.consumed_counts(), "saved_state_ranks": saved,
+                    "segment_export_complete": True, "segment_export_files": fc.segment_export_inventory(output),
+                }
+                if complete:
+                    report.update({
+                        "export_complete": True, "full_pass_source_counts": value["source_counts"],
+                        "full_pass_exposure_counts": value["exposure_counts"], "total_completed_exposures": 64,
+                    })
+                for name in ("full_corpus.json", *(f"full_corpus.rank{rank}.json" for rank in range(8))):
+                    atomic_json(output / name, report)
+                verified = fc.verify_full_segment(output, contract, runtime)
+                self.assertEqual(verified["completed_exposures"], step * 32)
+                self.assertIs(verified["corpus_complete"], complete)
+                self.assertEqual(verified["consumed_counts"], cursor.consumed_counts())
+                if complete:
+                    with self.assertRaisesRegex(ValueError, "Incompatible"):
+                        fc.validate_full_checkpoint(path, runtime, contract)
+                with self.assertRaisesRegex(ValueError, "audited"):
+                    fc.verify_full_segment(output, contract, {})
+                bad = copy.deepcopy(report)
+                bad["consumed_counts"]["exposure_counts"]["hpf"] += 1
+                atomic_json(output / "full_corpus.json", bad)
+                with self.assertRaisesRegex(ValueError, "completed-update replay"):
+                    fc.verify_full_segment(output, contract)
+                atomic_json(output / "full_corpus.json", report)
+                (output / "model.safetensors").write_bytes(b"renamed-old-model")
+                with self.assertRaisesRegex(ValueError, "export file inventory/hash"):
+                    fc.verify_full_segment(output, contract)
 
 
 class FullCorpusRuntimeTests(unittest.TestCase):
@@ -469,15 +548,27 @@ class FullCorpusRuntimeTests(unittest.TestCase):
                     model_load.assert_not_called()
 
     def test_actual_main_uses_whole_horizon_and_defers_partial_segment_export(self):
+        self._assert_main_export(False)
+
+    def test_contracted_intermediate_export_does_not_claim_corpus_completion(self):
+        self._assert_main_export(True)
+
+    def _assert_main_export(self, export):
         with tempfile.TemporaryDirectory() as tmp:
-            cfg, _ = fixture(tmp)
+            cfg, value = fixture(tmp)
+            value["export_at_segment_end"] = export
+            atomic_json(Path(cfg.full_corpus_contract), value)
+            Path(cfg.output_dir).mkdir()
             tokenizer = CharacterTokenizer()
             tokenizer.pad_token, tokenizer.pad_token_id = "pad", 0
+            tokenizer.save_pretrained = Mock()
             model_config = SimpleNamespace(model_type="qwen3_5", to_dict=lambda: {"model_type": "qwen3_5"})
             model_class = Mock()
-            model_class.from_pretrained.return_value = SimpleNamespace(parameters=lambda: [SimpleNamespace(ds_id=1)])
+            model_class.from_pretrained.return_value = SimpleNamespace(
+                config=model_config, parameters=lambda: [SimpleNamespace(ds_id=1)],
+            )
             observer = Mock(report={"corpus_complete": False})
-            trainer = Mock(state=SimpleNamespace(global_step=1))
+            trainer = Mock(state=SimpleNamespace(global_step=1, best_metric=None, best_model_checkpoint=None))
             trainer.train.return_value = SimpleNamespace(training_loss=1.0)
             versions = {"torch": "2.6.0+cu124", "transformers": "5.19.0", "accelerate": "1.15.0", "deepspeed": "0.16.9"}
             with patch("sys.argv", ["sft_train.py", "--config", "unused", "--no-wandb"]), patch.object(
@@ -494,14 +585,25 @@ class FullCorpusRuntimeTests(unittest.TestCase):
                 "sft.bounded_validation.exchange", side_effect=lambda item, config: [item] * 8
             ), patch("importlib.metadata.version", side_effect=lambda name: versions.get(name, "fixture")), patch(
                 "transformers.integrations.deepspeed.is_deepspeed_zero3_enabled", return_value=True
-            ):
+            ), patch("torch.distributed.barrier"):
                 sft_train.main()
             self.assertEqual(training_args.call_args.kwargs["max_steps"], 4)
             self.assertIs(training_args.call_args.kwargs["save_only_model"], False)
             self.assertIs(training_args.call_args.kwargs["ignore_data_skip"], False)
             self.assertEqual(training_args.call_args.kwargs["data_seed"], 42)
             observer.finish.assert_called_once_with(1, 1.0)
-            trainer.save_model.assert_not_called()
+            if export:
+                trainer.save_model.assert_called_once()
+                trainer.save_state.assert_called_once()
+                tokenizer.save_pretrained.assert_called_once_with(cfg.output_dir)
+                self.assertTrue(observer.report["segment_export_complete"])
+                self.assertIs(observer.report["corpus_complete"], False)
+                self.assertNotIn("export_complete", observer.report)
+                summary = json.loads((Path(cfg.output_dir) / "training_summary.json").read_text())
+                self.assertIs(summary["full_corpus"]["corpus_complete"], False)
+                self.assertTrue(summary["full_corpus"]["segment_export_complete"])
+            else:
+                trainer.save_model.assert_not_called()
             self.assertEqual(trainer.train.call_args.kwargs["resume_from_checkpoint"], None)
 
 
@@ -570,6 +672,13 @@ class NativeFullSamplerResumeTests(unittest.TestCase):
             first = make(str(Path(tmp) / "split"), stop=True)
             first.train()
             self.assertEqual(first.state.global_step, 1)
+            first.save_model()
+            self.assertTrue((Path(first.args.output_dir) / "generation_config.json").is_file())
+            self.assertTrue((Path(first.args.output_dir) / "config.json").is_file())
+            exported = Qwen3_5ForConditionalGeneration.from_pretrained(first.args.output_dir, local_files_only=True)
+            self.assertEqual(state_sha256(first.model.state_dict()), state_sha256(exported.state_dict()))
+            self.assertEqual(exported.config.model_type, "qwen3_5")
+            self.assertTrue(hasattr(exported.model, "visual"))
             resumed = make(first.args.output_dir)
             resumed.train(resume_from_checkpoint=str(Path(first.args.output_dir) / "checkpoint-1"))
             self.assertEqual(resumed.state.global_step, 4)

@@ -442,6 +442,7 @@ The strict schema1 JSON requires exactly these top-level fields:
 | Field | Required content |
 |---|---|
 | `schema_version`, `quality_train` | Integer `1`, boolean `false` |
+| `export_at_segment_end` | Explicit boolean; `true` enables native HF retention export after each completed segment checkpoint |
 | `model` | `{base_model, revision}` matching actual local model path and pinned revision |
 | `input_files` | `train`, `val`, `ledger`, each `{path, sha256}` |
 | `artifacts` | Nonempty `sources`, `instructions`, `tokenizer` maps, each named entry `{path, sha256}` |
@@ -534,13 +535,61 @@ horizon, or missing/corrupt state is rejected, never treated as warmstart.
 `full_corpus.json` and `full_corpus.rankN.json` report runtime/topology/NCCL
 proof, actual optimizer group coverage, preload partition proof, saved/
 restored state and RNG rank proofs, segment boundaries, and coverage cursors.
-Intermediate segments report `segment_complete`, `corpus_complete: false`;
-there is no final export. Only the exact whole horizon reports
+Intermediate segments report `segment_complete`, `corpus_complete: false`.
+With contracted `export_at_segment_end: false`, they do not export. With
+`true`, after the complete native checkpoint they execute the same all-rank
+HF `Trainer.save_model`/state and rank-zero tokenizer path, including native
+HF generation config, and record `segment_export_complete: true` separately
+from corpus completion. This allows orchestration-owned retention evaluation
+of that actual snapshot after DS exits; it grants neither evaluation/job
+authorization nor a full-coverage claim. Only the exact whole horizon reports
 `corpus_complete`, full-pass source/exposure counts and total completed
 exposures; final full-model export still requires all-rank barriers.
+Exact-horizon export additionally records `export_complete: true`.
 Segment training loss is labeled as segment-only. This is coverage/state
 evidence, not a quality result, throughput forecast, or promise of finishing
-within a runtime ceiling.
+within a runtime ceiling. `segment_export_files` records actual native HF
+model/generation/tokenizer/chat-template filenames and streamed `{bytes,
+sha256}` identities after all writes, including actual single/sharded
+safetensors layout rather than assuming a filename. Hashing reads at most
+8 MiB per chunk; it adds real checkpoint/export wall-time overhead.
+
+Public read-only integration helpers are:
+
+```python
+FullCorpusContract(path, cfg)
+validate_full_checkpoint(path, runtime_contract, contract,
+                         verify_files=True, for_resume=True)
+verify_full_segment(output_dir, contract, expected_runtime_contract=None)
+segment_export_inventory(path)
+```
+
+The first validates actual staged worker-local data/source/ledger/tokenizer/
+instruction/permutation identities without initializing a model. `cfg` is
+the rendered `SFTConfig` or an equivalent field-bearing object. It does not
+itself tokenize the full corpus; runtime `validate_dataset(dataset, stats)`
+adds no-skip/target/predecessor/crop checks and the tokenized identity.
+`validate_full_checkpoint` rejects the final horizon for resume; a read-only
+consumer can set `for_resume=False` to validate a final checkpoint too.
+`verify_full_segment` derives `checkpoint-N` from the downloaded report,
+recomputes full file hashes, replays completed-update IDs, reconstructs
+actual per-task distinct-source/exposure counts and all rank coverage
+digests, compares saved rank fingerprints and report consistency, and
+verifies native HF export hashes/completion independently of summary counts.
+Supply the audited expected runtime contract when available; otherwise its
+worker-specific package/model/DS/code fields require additional consumer
+validation. This is artifact/coverage consistency verification, **not**
+offline reconstruction of original GPU tensor-state hashes or a model
+quality/strict-load test. Those remain the evaluator's responsibility.
+
+For a new job, copy only the immutable immediately preceding completed
+`checkpoint-N` (including its journal/marker/all native shards) into the same
+stable output path. The live `full_corpus_coverage.jsonl` may be absent: rank
+zero restores the exact checkpoint journal after initialization proof.
+If present, it must match byte-for-byte; do not create an empty journal or
+truncate an advanced journal. Any unresolved in-flight intent stops admission.
+All model/input/output/contract/config paths must remain identical across
+segments; do not silently rebase a contract when validating downloaded files.
 
 CPU regressions cover actual Accelerate eight-shard full-pass permutations,
 ledger/raw-source/hash/frequency failures, safe target-preserving crops,
