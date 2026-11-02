@@ -484,6 +484,19 @@ The prepared train-file SHA binds the instruction-normalized exposure rows
 in the same order; the orchestration audit owns that source-to-prepared-row
 derivation.
 
+Full-corpus raw rows have exactly `{task, messages}`, with each message
+exactly `{role, content}` containing text. `full_corpus_raw_dataset(records)`
+constructs this schema directly with Arrow `large_string` for task, role
+and content, and `large_list(struct)` for messages, **before** ordinary
+datasets fingerprinting. Arrow32 string offsets can overflow when the
+fingerprinter combines message-content chunks exceeding 2 GiB even though
+individual records are valid. Explicit 64-bit offsets preserve every field,
+row, message and content byte without disabling fingerprints or skipping
+rows. Unexpected raw fields/types fail instead of being projected away.
+Ordinary and bounded-diagnostic `Dataset.from_list` construction is unchanged.
+This fixes Arrow offset representability, not full-corpus tokenization RAM,
+throughput, or GPU continuation; those still require observed evidence.
+
 Pass `p` uses actual CPU `torch.randperm(N, generator=manual_seed(42+p))`.
 The sampler supports native `set_epoch`; Accelerate shards this permutation
 without replacements. Permutation SHA is over the contiguous CPU int64

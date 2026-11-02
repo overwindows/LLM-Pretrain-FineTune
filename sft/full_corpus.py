@@ -35,6 +35,28 @@ SAMPLER_ALGORITHM = "torch-randperm-seed-plus-pass-v1"
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
+def full_corpus_raw_dataset(records):
+    """Construct the approved raw text schema with 64-bit byte/child offsets."""
+    import pyarrow as pa
+    from datasets import Dataset
+
+    for record in records:
+        exact_keys(record, {"task", "messages"}, "full-corpus raw row")
+        if record["task"] not in FREQUENCIES or not isinstance(record["messages"], list):
+            raise ValueError("Invalid full-corpus raw task/messages")
+        for message in record["messages"]:
+            exact_keys(message, {"role", "content"}, "full-corpus raw message")
+            if not isinstance(message["role"], str) or not isinstance(message["content"], str):
+                raise ValueError("Full-corpus raw messages require exact text role/content")
+    schema = pa.schema([
+        pa.field("task", pa.large_string()),
+        pa.field("messages", pa.large_list(pa.struct([
+            pa.field("role", pa.large_string()), pa.field("content", pa.large_string()),
+        ]))),
+    ])
+    return Dataset(pa.Table.from_pylist(records, schema=schema))
+
+
 def strict_json_text(text):
     def invalid(value):
         raise ValueError(f"Nonfinite JSON value: {value}")

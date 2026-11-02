@@ -3,6 +3,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import subprocess
@@ -58,7 +59,7 @@ def fixture(directory, passes=2):
     ledger = root / "ledger.jsonl"
     ledger.write_text("".join(json.dumps(row) + "\n" for row in ledger_rows))
     train = root / "train.jsonl"
-    train.write_text("".join(json.dumps(record()) + "\n" for _ in ledger_rows))
+    train.write_text("".join(json.dumps({"task": row["task"], **record()}) + "\n" for row in ledger_rows))
     val = root / "val.jsonl"
     val.write_text(json.dumps(record()) + "\n")
     ds = root / "zero3.json"
@@ -114,6 +115,54 @@ def evidence(contract, step):
 
 
 class FullCorpusContractTests(unittest.TestCase):
+    @unittest.skipUnless(
+        os.environ.get("SFT_ARROW64_LARGE_REGRESSION") == "1",
+        "Opt-in real >2GiB Arrow fingerprint regression requires measured host RAM",
+    )
+    def test_real_over_2gib_reused_string_buffers_reject_arrow32_and_fingerprint_arrow64(self):
+        import pyarrow as pa
+        from datasets import Dataset
+
+        payload = "x" * (1024 * 1024)
+        chunk = pa.array([payload], type=pa.string())
+        count = 2049
+        narrow = pa.chunked_array([chunk] * count)
+        self.assertGreater(count * len(payload), 2 ** 31 - 1)
+        with self.assertRaisesRegex(pa.ArrowInvalid, "offset overflow"):
+            narrow.combine_chunks()
+        wide = pa.chunked_array([chunk.cast(pa.large_string())] * count)
+        dataset = Dataset(pa.Table.from_arrays([wide], names=["content"]))
+        self.assertTrue(dataset._fingerprint)
+        self.assertEqual(dataset.num_rows, count)
+        self.assertEqual(dataset[0]["content"], payload)
+        self.assertEqual(dataset[count - 1]["content"], payload)
+        combined = dataset.data.column("content").combine_chunks()
+        self.assertEqual(combined.buffers()[2].size, count * len(payload))
+        self.assertTrue(pa.types.is_large_string(combined.type))
+
+    def test_arrow64_raw_dataset_preserves_every_field_order_and_native_fingerprint(self):
+        import pyarrow as pa
+        rows = [{"task": task, "messages": [
+            {"role": "system", "content": "instruction"},
+            {"role": "user", "content": f"unicode \u4e2d {index}"},
+            {"role": "assistant", "content": ""},
+        ]} for index, task in enumerate(("gem", "hpf", "mai_profile"))]
+        dataset = fc.full_corpus_raw_dataset(rows)
+        self.assertEqual(list(dataset), rows)
+        self.assertTrue(pa.types.is_large_string(dataset.data.schema.field("task").type))
+        messages = dataset.data.schema.field("messages").type
+        self.assertTrue(pa.types.is_large_list(messages))
+        self.assertTrue(pa.types.is_large_string(messages.value_type.field("content").type))
+        self.assertTrue(dataset._fingerprint)
+        self.assertEqual(fc.full_corpus_raw_dataset(rows)._fingerprint, dataset._fingerprint)
+        for bad in (
+            [{**rows[0], "extra": "must-not-be-discarded"}],
+            [{"task": "gem", "messages": [{"role": "user", "content": "x", "extra": 1}]}],
+            [{"task": "gem", "messages": [{"role": "user", "content": None}]}],
+        ):
+            with self.assertRaises(ValueError):
+                fc.full_corpus_raw_dataset(bad)
+
     def test_exact_committed_full_module_archive_consumes_fixture_without_checkout_imports(self):
         root = Path(__file__).resolve().parents[2]
         raw = subprocess.check_output([
@@ -135,6 +184,8 @@ class FullCorpusContractTests(unittest.TestCase):
                 with patch.dict("sys.modules", modules):
                     spec.loader.exec_module(module)
             archived = modules["full_corpus"]
+            raw_rows = [{"task": "gem", **record()}]
+            self.assertEqual(list(archived.full_corpus_raw_dataset(raw_rows)), raw_rows)
             contract = archived.FullCorpusContract(cfg.full_corpus_contract, cfg)
             cursor = archived.CoverageCursor(contract)
             for step in range(1, 5):

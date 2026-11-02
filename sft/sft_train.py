@@ -214,7 +214,14 @@ def build_dataset(
                 "will be a no-op for every record"
             )
 
-    raw_ds = Dataset.from_list(records)
+    if record_context_crops:
+        if __package__:
+            from .full_corpus import full_corpus_raw_dataset
+        else:
+            from full_corpus import full_corpus_raw_dataset
+        raw_ds = full_corpus_raw_dataset(records)
+    else:
+        raw_ds = Dataset.from_list(records)
 
     _SKIP = {"input_ids": [], "attention_mask": [], "labels": []}
 
