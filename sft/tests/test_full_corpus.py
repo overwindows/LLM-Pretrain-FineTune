@@ -155,6 +155,13 @@ class FullCorpusContractTests(unittest.TestCase):
         self.assertTrue(pa.types.is_large_string(messages.value_type.field("content").type))
         self.assertTrue(dataset._fingerprint)
         self.assertEqual(fc.full_corpus_raw_dataset(rows)._fingerprint, dataset._fingerprint)
+        with tempfile.TemporaryDirectory() as tmp:
+            mapped = fc.full_corpus_raw_dataset(rows, Path(tmp) / "raw.arrow")
+            self.assertEqual(list(mapped), rows)
+            self.assertEqual(mapped.data.schema, dataset.data.schema)
+            self.assertEqual(type(mapped.data).__name__, "MemoryMappedTable")
+            self.assertTrue(mapped._fingerprint)
+            del mapped
         for bad in (
             [{**rows[0], "extra": "must-not-be-discarded"}],
             [{"task": "gem", "messages": [{"role": "user", "content": "x", "extra": 1}]}],
@@ -186,6 +193,10 @@ class FullCorpusContractTests(unittest.TestCase):
             archived = modules["full_corpus"]
             raw_rows = [{"task": "gem", **record()}]
             self.assertEqual(list(archived.full_corpus_raw_dataset(raw_rows)), raw_rows)
+            mapped = archived.full_corpus_raw_dataset(raw_rows, Path(tmp) / "raw.arrow")
+            self.assertEqual(list(mapped), raw_rows)
+            self.assertEqual(type(mapped.data).__name__, "MemoryMappedTable")
+            del mapped
             contract = archived.FullCorpusContract(cfg.full_corpus_contract, cfg)
             cursor = archived.CoverageCursor(contract)
             for step in range(1, 5):
@@ -239,6 +250,50 @@ class FullCorpusContractTests(unittest.TestCase):
                     contract.validate_dataset(dataset, bad_stats)
             with self.assertRaisesRegex(ValueError, "skip or subsample"):
                 contract.validate_dataset(dataset.select(range(32)), stats)
+
+    def test_owned_raw_temp_cleanup_keeps_returned_dataset_independent_and_values_stable(self):
+        from datasets import load_from_disk
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, _ = fixture(tmp)
+            native_temporary = tempfile.TemporaryDirectory
+            paths = []
+            def temporary(*args, **kwargs):
+                value = native_temporary(*args, **kwargs)
+                paths.append(Path(value.name))
+                return value
+            outputs, identities = [], []
+            with patch("sft.sft_train.tempfile.TemporaryDirectory", side_effect=temporary):
+                for _ in range(2):
+                    stats = {}
+                    dataset = build_dataset(
+                        cfg.train_jsonl, CharacterTokenizer(), cfg.max_seq_len,
+                        enable_thinking=False, validation_stats=stats, record_context_crops=True,
+                    )
+                    self.assertEqual(dataset.cache_files, [])
+                    self.assertEqual(type(dataset.data).__name__, "InMemoryTable")
+                    contract = fc.FullCorpusContract(cfg.full_corpus_contract, cfg)
+                    contract.validate_dataset(dataset, stats)
+                    identities.append(contract.tokenized_sha256)
+                    outputs.append(dataset)
+            self.assertNotEqual(paths[0], paths[1])
+            self.assertTrue(all(not path.exists() for path in paths))
+            self.assertEqual(list(outputs[0]), list(outputs[1]))
+            self.assertEqual(identities[0], identities[1])
+            saved = Path(tmp) / "saved-tokenized"
+            outputs[0].save_to_disk(saved)
+            self.assertEqual(list(load_from_disk(saved)), list(outputs[0]))
+            def fail_tokenization(*args, **kwargs):
+                raise ValueError("explicit tokenization failure")
+            with patch("sft.sft_train.tempfile.TemporaryDirectory", side_effect=temporary), patch.object(
+                sft_train, "tokenize_record", new=fail_tokenization
+            ):
+                with self.assertRaisesRegex(ValueError, "explicit tokenization"):
+                    build_dataset(
+                        cfg.train_jsonl, CharacterTokenizer(), cfg.max_seq_len,
+                        enable_thinking=False, validation_stats={}, record_context_crops=True,
+                    )
+            self.assertTrue(all(not path.exists() for path in paths))
 
     def test_contract_rejects_wrong_hash_horizon_frequency_permutation_remainder_and_unknown_fields(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -26,6 +26,7 @@ import logging
 import math
 import os
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -214,12 +215,22 @@ def build_dataset(
                 "will be a no-op for every record"
             )
 
+    n_total = len(records)
+    raw_temporary = None
     if record_context_crops:
         if __package__:
             from .full_corpus import full_corpus_raw_dataset
         else:
             from full_corpus import full_corpus_raw_dataset
-        raw_ds = full_corpus_raw_dataset(records)
+        raw_temporary = tempfile.TemporaryDirectory(prefix="sft-full-raw-")
+        try:
+            raw_ds = full_corpus_raw_dataset(records, Path(raw_temporary.name) / "raw.arrow")
+        except Exception:
+            raw_temporary.cleanup()
+            raise
+        # Raw text now lives in the mapped temporary Arrow file, not both a
+        # retained Python corpus and a second giant in-memory Arrow payload.
+        records = []
     else:
         raw_ds = Dataset.from_list(records)
 
@@ -261,29 +272,35 @@ def build_dataset(
     n_workers = None
     logger.info(
         "[SFT] Tokenizing %s (%d records) in-process to prevent multi-rank OOM",
-        jsonl_path, len(records),
+        jsonl_path, n_total,
     )
 
-    tokenized_ds = raw_ds.map(
-        _map_fn,
-        with_indices=True,
-        num_proc=n_workers,
-        remove_columns=raw_ds.column_names,
-        desc=f"Tokenizing {os.path.basename(jsonl_path)}",
-        # Keep only records where input_ids was produced (skip → empty dict)
-        load_from_cache_file=validation_stats is None,
-    )
+    try:
+        tokenized_ds = raw_ds.map(
+            _map_fn,
+            with_indices=True,
+            num_proc=n_workers,
+            remove_columns=raw_ds.column_names,
+            desc=f"Tokenizing {os.path.basename(jsonl_path)}",
+            # Keep only records where input_ids was produced (skip → empty dict)
+            load_from_cache_file=validation_stats is None,
+            **({"keep_in_memory": True} if record_context_crops else {}),
+        )
+    finally:
+        del raw_ds
+        if raw_temporary is not None:
+            raw_temporary.cleanup()
 
     # Filter out skipped records (empty lists from _SKIP sentinel)
     tokenized_ds = tokenized_ds.filter(
         lambda x: len(x["input_ids"]) > 0,
         num_proc=n_workers,
         desc="Filtering skipped",
+        **({"keep_in_memory": True} if record_context_crops else {}),
     )
 
     # Compute stats for logging
     n_kept = len(tokenized_ds)
-    n_total = len(records)
     n_skipped = n_total - n_kept
     n_overlong = sum(1 for ids in tokenized_ds["input_ids"] if len(ids) == max_seq_len)
 

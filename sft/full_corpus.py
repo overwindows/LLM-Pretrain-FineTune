@@ -35,7 +35,7 @@ SAMPLER_ALGORITHM = "torch-randperm-seed-plus-pass-v1"
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
-def full_corpus_raw_dataset(records):
+def full_corpus_raw_dataset(records, arrow_path=None):
     """Construct the approved raw text schema with 64-bit byte/child offsets."""
     import pyarrow as pa
     from datasets import Dataset
@@ -54,7 +54,14 @@ def full_corpus_raw_dataset(records):
             pa.field("role", pa.large_string()), pa.field("content", pa.large_string()),
         ]))),
     ])
-    return Dataset(pa.Table.from_pylist(records, schema=schema))
+    if arrow_path is None:
+        return Dataset(pa.Table.from_pylist(records, schema=schema))
+    # Standard memory-mapped Dataset fingerprinting avoids pickling the entire
+    # multi-GiB raw payload while preserving every record in native Arrow.
+    with pa.OSFile(str(arrow_path), "wb") as stream, pa.ipc.new_stream(stream, schema) as writer:
+        for start in range(0, len(records), 1024):
+            writer.write_batch(pa.RecordBatch.from_pylist(records[start:start + 1024], schema=schema))
+    return Dataset.from_file(str(arrow_path))
 
 
 def strict_json_text(text):
