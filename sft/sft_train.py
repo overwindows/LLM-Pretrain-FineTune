@@ -139,6 +139,8 @@ class SFTConfig:
     bounded_validation: dict[str, Any] | None = None
     validation_fixed_order: bool = False
     validation_checkpoint_step: int | None = None
+    full_corpus_contract: str | None = None
+    full_corpus_segment_end_step: int | None = None
 
     @classmethod
     def from_yaml(cls, path: str) -> "SFTConfig":
@@ -175,6 +177,7 @@ def build_dataset(
     num_proc: int | None = None,
     enable_thinking: bool | None = None,
     validation_stats: dict[str, Any] | None = None,
+    record_context_crops: bool = False,
 ) -> Dataset:
     """Build a tokenized HuggingFace Dataset from a JSONL file.
 
@@ -184,6 +187,8 @@ def build_dataset(
     records = load_jsonl(jsonl_path)
     if not records:
         raise ValueError(f"Empty dataset: {jsonl_path}")
+    if record_context_crops and validation_stats is None:
+        raise ValueError("Full-corpus crop evidence requires tokenization statistics")
     # Check all rows before subsampling or projecting away the raw columns.
     for rec in records:
         validate_sample_weight(rec)
@@ -241,6 +246,8 @@ def build_dataset(
         output = result if result is not None else dict(_SKIP)
         if validation_stats is not None:
             output["_validation_row_index"] = index
+        if record_context_crops:
+            output["_full_corpus_context_tokens_removed"] = stats.get("context_tokens_removed", 0)
         return output
 
     # New datasets versions also spawn a worker for num_proc=1.
@@ -369,6 +376,46 @@ def main():
     cfg = SFTConfig.from_yaml(args.config)
     if args.override_output_dir:
         cfg.output_dir = args.override_output_dir
+    full_corpus = None
+    if cfg.full_corpus_contract is not None:
+        if (
+            args.debug or args.smoke_test or args.max_steps != -1 or args.override_output_dir
+            or cfg.bounded_validation is not None or cfg.validation_fixed_order
+            or cfg.validation_checkpoint_step is not None or not cfg.deepspeed_config
+            or cfg.eval_strategy != "no" or cfg.save_strategy != "no"
+            or cfg.resume_from_checkpoint == "auto"
+            or cfg.model_revision != "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
+        ):
+            raise ValueError(
+                "Full-corpus mode requires its separate contract, pinned Qwen3.5 revision, active DS, "
+                "no diagnostic/debug/max-steps overrides, no scheduled saves/eval and explicit resume"
+            )
+        if __package__:
+            from .full_corpus import (
+                COLLECTIVES, FullCorpusContract, FullCorpusMeasurements, FullCorpusTrainer,
+                contract_sha256, validate_full_checkpoint,
+            )
+        else:
+            from full_corpus import (
+                COLLECTIVES, FullCorpusContract, FullCorpusMeasurements, FullCorpusTrainer,
+                contract_sha256, validate_full_checkpoint,
+            )
+        full_corpus = FullCorpusContract(cfg.full_corpus_contract, cfg)
+        if (
+            isinstance(cfg.full_corpus_segment_end_step, bool)
+            or not isinstance(cfg.full_corpus_segment_end_step, int)
+            or cfg.full_corpus_segment_end_step not in full_corpus.value["segment_end_steps"]
+        ):
+            raise ValueError("Full-corpus segment end must be an explicit contracted optimizer-step boundary")
+        destination = Path(cfg.output_dir) / f"checkpoint-{cfg.full_corpus_segment_end_step}"
+        if destination.exists():
+            raise ValueError("Refusing to overwrite an existing full-corpus segment checkpoint")
+        if (Path(cfg.output_dir) / "full_corpus_inflight.json").exists():
+            raise ValueError("Unresolved full-corpus in-flight update; refusing resume/replay")
+        if not cfg.resume_from_checkpoint and (Path(cfg.output_dir) / "full_corpus_coverage.jsonl").exists():
+            raise ValueError("Refusing to replay an existing full-corpus coverage journal")
+    elif cfg.full_corpus_segment_end_step is not None:
+        raise ValueError("full_corpus_segment_end_step requires full_corpus_contract")
     if not isinstance(cfg.validation_fixed_order, bool):
         raise ValueError("validation_fixed_order must be boolean")
     if cfg.deepspeed_config and not args.debug and not args.smoke_test:
@@ -457,6 +504,8 @@ def main():
     )
     model_class = model_class_for_config(model_config, transformers)
     is_qwen35 = model_config.model_type == "qwen3_5"
+    if full_corpus is not None and not is_qwen35:
+        raise ValueError("Full-corpus contract requires the full Qwen3.5 model family")
     if is_qwen35 and not isinstance(cfg.enable_thinking, bool):
         raise ValueError("Qwen3.5 requires explicit enable_thinking: false or true")
 
@@ -472,13 +521,14 @@ def main():
 
     # --- Datasets ---
     debug_n = 32 if (args.debug or args.smoke_test) else None
-    dataset_stats = {"train": {}, "val": {}} if validation is not None else None
+    dataset_stats = {"train": {}, "val": {}} if validation is not None or full_corpus is not None else None
     logger.info("Building train dataset ...")
     train_ds = build_dataset(
         cfg.train_jsonl, tokenizer, cfg.max_seq_len, debug_n,
         mask_think_in_loss=cfg.mask_think_in_loss,
         enable_thinking=cfg.enable_thinking,
         validation_stats=dataset_stats["train"] if dataset_stats is not None else None,
+        record_context_crops=full_corpus is not None,
     )
     logger.info("Building val dataset ...")
     val_ds = build_dataset(
@@ -487,6 +537,8 @@ def main():
         enable_thinking=cfg.enable_thinking,
         validation_stats=dataset_stats["val"] if dataset_stats is not None else None,
     )
+    if full_corpus is not None:
+        full_corpus.validate_dataset(train_ds, dataset_stats["train"])
 
     if len(train_ds) == 0:
         logger.error("Empty train dataset")
@@ -494,7 +546,12 @@ def main():
 
     # --- TrainingArguments ---
     logger.info("Building TrainingArguments ...")
-    if args.smoke_test:
+    if full_corpus is not None:
+        max_steps = full_corpus.value["total_max_steps"]
+        eval_strategy = cfg.eval_strategy
+        save_strategy = cfg.save_strategy
+        logging_steps = cfg.logging_steps
+    elif args.smoke_test:
         max_steps = 5
         eval_strategy = "no"
         save_strategy = "no"
@@ -551,11 +608,74 @@ def main():
             "ignore_data_skip": False, "data_seed": cfg.seed,
             "accelerator_config": {"use_seedable_sampler": True},
             "save_only_model": False,
-        } if cfg.validation_checkpoint_step is not None else {}),
+        } if cfg.validation_checkpoint_step is not None or full_corpus is not None else {}),
     )
     logger.info("TrainingArguments built.")
     checkpoint_contract = None
     resume_manifest = None
+    full_runtime_contract = None
+    full_resume_manifest = None
+    if full_corpus is not None:
+        if training_args.world_size != 8:
+            raise RuntimeError("Full-corpus training requires actual world size eight before loading")
+        full_ds_input = json.loads(Path(cfg.deepspeed_config).read_text())
+        if (
+            full_ds_input.get("zero_optimization", {}).get("stage") != 3
+            or "optimizer" in full_ds_input or "scheduler" in full_ds_input
+            or full_ds_input.get("zero_optimization", {}).get("offload_optimizer")
+            or full_ds_input.get("zero_optimization", {}).get("offload_param")
+        ):
+            raise ValueError("Full-corpus resume requires ZeRO3/native AdamW/external HF scheduler/no offload")
+        config_identity = dict(cfg.__dict__)
+        config_identity.pop("resume_from_checkpoint")
+        config_identity.pop("full_corpus_segment_end_step")
+        full_runtime_contract = {
+            "corpus": full_corpus.value, "sft_config": config_identity,
+            "tokenized_train_sha256": full_corpus.tokenized_sha256,
+            "model_config": model_config.to_dict(),
+            "deepspeed_input": deepspeed_config_snapshot(full_ds_input),
+            "packages": {
+                name: importlib.metadata.version(name)
+                for name in ("torch", "transformers", "accelerate", "deepspeed", "datasets", "tokenizers")
+            },
+            "trainer_code_sha256": {
+                name: file_sha256(Path(__file__).with_name(name))
+                for name in ("sft_train.py", "bounded_validation.py", "training_utils.py", "full_corpus.py")
+            },
+        }
+        required_packages = {"torch": "2.6.0+cu124", "transformers": "5.19.0", "accelerate": "1.15.0", "deepspeed": "0.16.9"}
+        if any(full_runtime_contract["packages"][name] != version for name, version in required_packages.items()):
+            raise ValueError("Full-corpus contract requires the unchanged pinned torch/TF/Accelerate/DS stack")
+        full_runtime_contract = json.loads(json.dumps(full_runtime_contract, allow_nan=False))
+        if len(set(exchange(contract_sha256(full_runtime_contract), COLLECTIVES))) != 1:
+            raise ValueError("Ranks disagree on full-corpus runtime/data/package/source contract")
+        if cfg.resume_from_checkpoint:
+            def validate_full_resume():
+                nonlocal full_resume_manifest
+                full_resume_manifest = validate_full_checkpoint(
+                    Path(cfg.resume_from_checkpoint), full_runtime_contract, full_corpus,
+                    verify_files=training_args.process_index == 0,
+                )
+                saved_step = full_resume_manifest["checkpoint_step"]
+                boundaries = full_corpus.value["segment_end_steps"]
+                if boundaries.index(cfg.full_corpus_segment_end_step) != boundaries.index(saved_step) + 1:
+                    raise ValueError("Full-corpus resume must continue the next planned segment without replay/skips")
+                if Path(cfg.resume_from_checkpoint).resolve() != (
+                    Path(cfg.output_dir) / f"checkpoint-{saved_step}"
+                ).resolve():
+                    raise ValueError("Full-corpus resume must use the explicit same-output checkpoint")
+                journal = Path(cfg.output_dir) / "full_corpus_coverage.jsonl"
+                saved_journal = Path(cfg.resume_from_checkpoint) / "coverage.jsonl"
+                if journal.exists() and file_sha256(journal) != file_sha256(saved_journal):
+                    raise ValueError("Live coverage advanced beyond checkpoint; refusing update replay")
+            collective_action(validate_full_resume, COLLECTIVES, "full-corpus checkpoint preflight")
+            manifest_hashes = exchange(
+                file_sha256(Path(cfg.resume_from_checkpoint) / "full_corpus_checkpoint.json"), COLLECTIVES,
+            )
+            if len(set(manifest_hashes)) != 1:
+                raise ValueError("Ranks read different full-corpus checkpoint completion manifests")
+        elif cfg.full_corpus_segment_end_step != full_corpus.value["segment_end_steps"][0]:
+            raise ValueError("Fresh full-corpus training must begin at the first planned segment")
     if validation is not None and validation.expected_world_size == 8:
         if training_args.world_size != 8:
             raise RuntimeError("Expected eight distributed ranks before model loading")
@@ -611,7 +731,7 @@ def main():
 
     # TrainingArguments retains HfTrainerDeepSpeedConfig's weakref before
     # from_pretrained checks it to enter deepspeed.zero.Init for ZeRO-3.
-    if validation is not None:
+    if validation is not None or full_corpus is not None:
         from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
         if not is_deepspeed_zero3_enabled():
             raise RuntimeError("ZeRO-3 configuration must be active before model loading")
@@ -632,6 +752,20 @@ def main():
         if hasattr(model, "enable_input_require_grads"):
             model.enable_input_require_grads()
     measurements = None
+    full_measurements = None
+    if full_corpus is not None:
+        partitioned = sum(hasattr(parameter, "ds_id") for parameter in model.parameters())
+        collective_check(
+            None if partitioned else "Full-corpus model loading did not use ZeRO3 partitions",
+            COLLECTIVES, "full-corpus pre-load ZeRO3",
+        )
+        full_measurements = FullCorpusMeasurements(
+            full_corpus, cfg.output_dir, cfg.full_corpus_segment_end_step, full_runtime_contract,
+            cfg.resume_from_checkpoint, full_resume_manifest,
+        )
+        full_measurements.report["zero3_initialization"] = {
+            "active_before_from_pretrained": True, "partitioned_parameter_count": partitioned,
+        }
     if validation is not None:
         partitioned = sum(hasattr(p, "ds_id") for p in model.parameters())
         collective_check(
@@ -661,6 +795,9 @@ def main():
         {"measurements": measurements, "fixed_order": cfg.validation_fixed_order}
         if measurements is not None else {}
     )
+    if full_measurements is not None:
+        trainer_class = FullCorpusTrainer
+        validation_kwargs = {"measurements": full_measurements}
     trainer = trainer_class(
         model=model,
         args=training_args,
@@ -688,6 +825,11 @@ def main():
 
     try:
         train_result = trainer.train(resume_from_checkpoint=resume)
+        if full_measurements is not None:
+            full_measurements.finish(trainer.state.global_step, train_result.training_loss)
+            if not full_measurements.report["corpus_complete"]:
+                logger.info("Full-state segment saved; corpus incomplete, final export deferred")
+                return
         if measurements is not None:
             if cfg.validation_checkpoint_step is not None and resume_manifest is None:
                 measurements.finish_checkpoint_phase(trainer.state.global_step, train_result.training_loss)
@@ -695,6 +837,8 @@ def main():
                 return
             measurements.finish(trainer.state.global_step, train_result.training_loss)
     except Exception as exc:
+        if full_measurements is not None:
+            full_measurements.fail(exc)
         if measurements is not None:
             measurements.fail(exc)
         raise
@@ -702,7 +846,9 @@ def main():
         raise RuntimeError("Training loss is not finite; refusing to export the model")
 
     # --- Save final ---
-    distributed_validation = measurements is not None and validation.expected_world_size == 8
+    distributed_validation = (
+        measurements is not None and validation.expected_world_size == 8
+    ) or full_measurements is not None
 
     def save_weights():
         # ZeRO-3's 16-bit gather requires every rank, not only rank zero.
@@ -731,6 +877,7 @@ def main():
                         "global_step": trainer.state.global_step,
                         "training_loss": train_result.training_loss,
                         **({"bounded_validation": measurements.report} if measurements is not None else {}),
+                        **({"full_corpus": full_measurements.report} if full_measurements is not None else {}),
                     },
                     f, indent=2,
                 )
@@ -738,19 +885,23 @@ def main():
     logger.info("Saving final model to %s", cfg.output_dir)
     try:
         if distributed_validation:
+            export_collectives = COLLECTIVES if full_measurements is not None else validation
+            export_measurements = full_measurements if full_measurements is not None else measurements
             torch.distributed.barrier()
-            collective_action(save_weights, validation, "full model export")
+            collective_action(save_weights, export_collectives, "full model export")
             torch.distributed.barrier()
-            collective_action(save_tokenizer, validation, "rank-zero tokenizer export")
-            measurements.report["export_complete"] = True
-            measurements.persist()
-            collective_action(save_summary, validation, "rank-zero final summary")
+            collective_action(save_tokenizer, export_collectives, "rank-zero tokenizer export")
+            export_measurements.report["export_complete"] = True
+            export_measurements.persist()
+            collective_action(save_summary, export_collectives, "rank-zero final summary")
             torch.distributed.barrier()
         else:
             save_weights()
             save_tokenizer()
             save_summary()
     except Exception as exc:
+        if full_measurements is not None:
+            full_measurements.fail(exc)
         if measurements is not None:
             measurements.fail(exc)
         raise

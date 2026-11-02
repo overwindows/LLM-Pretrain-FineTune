@@ -409,6 +409,148 @@ phase stop/export behavior and carried telemetry. Neither establishes an
 actual eight-GPU DeepSpeed checkpoint/reload; that remains the bounded
 cloud validation owner's responsibility.
 
+### Separately opt-in full-corpus training
+
+`full_corpus_contract: <local JSON path>` and
+`full_corpus_segment_end_step: <planned absolute optimizer step>` select a
+separate trainer in `sft/full_corpus.py`. They do **not** relax any bounded
+eight/ten-update diagnostic guard. Do not supply `--max-steps`, `--debug`,
+`--smoke-test`, output overrides, or bounded-validation settings in this mode.
+Keep `eval_strategy: no`, `save_strategy: no`, and explicit resume paths.
+`num_train_epochs` must equal the manifest's `full_passes`; the scheduler uses
+the manifest's unchanged **whole-corpus** `total_max_steps` in every segment.
+Neither the trainer nor the manifest grants job submission or runtime/cost
+approval. The orchestration owner must separately enforce those budgets;
+expiration before the last step means an incomplete corpus, not completion.
+
+The current approved source inventory has `gem: 142608`, `hpf: 271009`,
+`mai_profile: 143278` retained sources (556895 total). Frequencies 1/2/1
+materialize 827904 physical exposures, not 556895 uniformly weighted rows.
+With eight ranks, microbatch one, accumulation four, each complete weighted
+pass requires 25872 updates. The initial contract rejects a nondivisible
+remainder explicitly: no dropped rows, shard padding/repeated initial rows,
+or silently shortened final accumulation groups. Any future partial-group
+policy requires separate implementation and proof. Native loss/masking is
+unchanged; HPF is approximately 65.47% of weighted row contributions, **not**
+the old balanced diagnostic's 50% or a token-weight share. A candidate
+learning rate such as `2.5e-6` is configuration, not evidence of quality.
+Cosine warmup ratio `.03` with horizon 25872 resolves to 777 warmup updates,
+not the old short diagnostic horizon.
+
+The strict schema1 JSON requires exactly these top-level fields:
+
+| Field | Required content |
+|---|---|
+| `schema_version`, `quality_train` | Integer `1`, boolean `false` |
+| `model` | `{base_model, revision}` matching actual local model path and pinned revision |
+| `input_files` | `train`, `val`, `ledger`, each `{path, sha256}` |
+| `artifacts` | Nonempty `sources`, `instructions`, `tokenizer` maps, each named entry `{path, sha256}` |
+| `source_counts`, `exposure_counts`, `frequencies` | Exact `gem`, `hpf`, `mai_profile` maps; frequencies 1/2/1; exposure counts equal source counts times frequencies |
+| `full_passes`, `total_max_steps` | Explicit positive integers; horizon equals passes times exposures/global batch |
+| `segment_end_steps` | Explicit strictly increasing positive absolute steps ending at total horizon |
+| `training` | All fields listed below, equal to the rendered SFT YAML |
+| `sampler` | `{algorithm: "torch-randperm-seed-plus-pass-v1", permutation_sha256: [one digest per pass]}` |
+
+`training` requires `world_size`, `per_device_train_batch_size`,
+`gradient_accumulation_steps`, `seed`, `learning_rate`, `weight_decay`,
+`optim`, `adam_beta1`, `adam_beta2`, `adam_epsilon`, `lr_scheduler_type`,
+`warmup_ratio`, `max_seq_len`, `enable_thinking`, `mask_think_in_loss`.
+The supported runtime is world8/micro1/accum4/seed42, native `adamw_torch`,
+cosine, explicit nonthinking and no think masking. The full dense
+Qwen3.5 revision remains `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`,
+with unused visual parameters frozen and retained in full checkpoints.
+Torch `2.6.0+cu124`, Transformers `5.19.0`, Accelerate `1.15.0`, and
+DeepSpeed `0.16.9` must match exactly. ZeRO3/native AdamW/external HF
+scheduler/no offload is required; no DeepSpeed optimizer/scheduler blocks,
+Muon adapter, stack upgrade, packing, replay, or LoRA is introduced.
+
+`artifacts.sources` must contain `gem`, `hpf`, `mai_profile` approved derived
+kept files; additional canonical/exclusion provenance artifacts are allowed.
+Every instruction artifact is hashed. Tokenizer artifacts must reside in
+the actual local base-model directory and cover every tokenizer vocabulary/
+config/special-token/chat-template asset there. All SHA256s are lowercase
+64-character hex; paths refer to actual immutable worker-local inputs.
+Unknown fields, duplicate JSON fields, and nonfinite JSON constants fail.
+
+The ordered ledger is JSONL with exactly `{task, source_id, exposure_index}`.
+Indices are integers 0..N-1 without gaps. `source_id` is
+`task:derivedSourceSHA:zeroBasedByteOffset:rawLineSHA`; offset must be a line
+boundary in that task's bound derived file, and raw-line SHA excludes only
+trailing CR/LF bytes, not whitespace. Each distinct source must occur exactly
+its task frequency. Source files, raw records, per-task distinct counts and
+physical exposure counts are verified, not inferred from a total row count.
+The prepared train-file SHA binds the instruction-normalized exposure rows
+in the same order; the orchestration audit owns that source-to-prepared-row
+derivation.
+
+Pass `p` uses actual CPU `torch.randperm(N, generator=manual_seed(42+p))`.
+The sampler supports native `set_epoch`; Accelerate shards this permutation
+without replacements. Permutation SHA is over the contiguous CPU int64
+vector's raw NumPy bytes; generate it in the **pinned worker Torch version**,
+not an assumed equivalent Windows/other-Torch RNG. Runtime compares each
+actual microbatch exposure index to the contracted pass/rank/micro index.
+All approved rows must tokenize successfully. Safe **left-context** cropping
+retains the entire gold target and predecessor with the existing exact chat
+prefix/mask algorithm; target cutting, skip, splitting, or repair is not
+allowed. Exact per-exposure context-removal counts are included in the
+tokenized hash, with weighted per-task crop counts/removed tokens/supervised
+token totals in `preprocessing_per_task`. `tokenized_train_sha256` hashes
+canonical sorted-key compact ASCII JSON per tokenized row plus a newline,
+including IDs, attention mask, labels, exposure index, and context-removal
+count. Contract/runtime hashes use sorted-key compact ASCII JSON SHA256.
+
+Every completed update collectively proves all eight ranks, four finite
+microbatch losses/rank, exact expected indices, one actual engine update,
+and no skipped update. Only then is rank-zero
+`full_corpus_coverage.jsonl` appended and fsynced. Coverage is **not** granted
+merely for a forward, planned file list, or Trainer sample count.
+`full_corpus_inflight.json` records update intent before forward and is
+removed only after durable completed-update evidence. An unresolved intent,
+live journal beyond the saved checkpoint, existing destination checkpoint,
+or automatic resume fails closed rather than replaying uncertain updates.
+
+At each explicit segment boundary native HF saves all DS model/AdamW shards,
+external scheduler, rank RNG, args, and Trainer state. After all-rank saves,
+`checkpoint-N/checkpoint_rankN.json` contains `{rank, state, rng_sha256,
+coverage}`. Actual model/FP32 masters/AdamW moments/scheduler hashes and step
+counters use the existing full-state helper. `coverage` contains `rank`,
+`global_step`, `completed_full_passes`, `partial_pass_optimizer_steps`,
+local `consumed_exposures`, and a cumulative `coverage_sha256` over canonical
+`{step, indices}` records for that rank. The rank-zero atomic
+`full_corpus_checkpoint.json` marker contains `schema_version: 1`,
+`checkpoint_step`, `runtime_contract`, `files: {path: {bytes, sha256}}`,
+and `saved_state_ranks`. Inventory includes immutable `coverage.jsonl`
+and all native rank state files; only the marker excludes itself.
+
+Resume must use the explicit same-output checkpoint at the immediately
+preceding planned boundary. Rank zero verifies full file hashes; all ranks
+replay/validate the completed-update journal, compare contract and manifest
+hashes, reconstruct their coverage cursor, and verify actual restored
+model/AdamW/scheduler state before updates. Native RNG restore is checked
+after data skipping and before the next forward. Changed inputs, instructions,
+tokenizer, packages, trainer source, batching, seed, optimizer, scheduler
+horizon, or missing/corrupt state is rejected, never treated as warmstart.
+
+`full_corpus.json` and `full_corpus.rankN.json` report runtime/topology/NCCL
+proof, actual optimizer group coverage, preload partition proof, saved/
+restored state and RNG rank proofs, segment boundaries, and coverage cursors.
+Intermediate segments report `segment_complete`, `corpus_complete: false`;
+there is no final export. Only the exact whole horizon reports
+`corpus_complete`, full-pass source/exposure counts and total completed
+exposures; final full-model export still requires all-rank barriers.
+Segment training loss is labeled as segment-only. This is coverage/state
+evidence, not a quality result, throughput forecast, or promise of finishing
+within a runtime ceiling.
+
+CPU regressions cover actual Accelerate eight-shard full-pass permutations,
+ledger/raw-source/hash/frequency failures, safe target-preserving crops,
+completed-update coverage and checkpoint inventories. Native tiny hybrid
+Qwen CPU training compares uninterrupted versus segmented resume across a
+pass boundary, with identical row order and bitwise model/AdamW state and
+exact scheduler state. DeepSpeed/CUDA save/restore tests use explicit mocks;
+actual eight-GPU full-corpus save/resume, memory and retention durability
+remain unverified locally and must not be claimed from these tests.
+
 ---
 
 How the Layer1-delta SFT model (`Qwen3-4B-Thinking-2507` → distilled on GPT-4o
