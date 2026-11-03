@@ -185,23 +185,10 @@ def build_dataset(
     Tokenization stays in-process on each rank to avoid a per-rank worker
     explosion. ``num_proc`` is retained for call compatibility, not used.
     """
-    records = load_jsonl(jsonl_path)
-    if not records:
-        raise ValueError(f"Empty dataset: {jsonl_path}")
     if record_context_crops and validation_stats is None:
         raise ValueError("Full-corpus crop evidence requires tokenization statistics")
-    # Check all rows before subsampling or projecting away the raw columns.
-    for rec in records:
-        validate_sample_weight(rec)
-        rec.pop("sample_weight", None)
-    if debug_subsample:
-        records = records[:debug_subsample]
-    if validation_stats is not None:
-        validation_stats.update({
-            "records": len(records), "kept": 0, "skipped": 0,
-            "left_truncated_records": 0, "context_tokens_removed": 0,
-            "skip_reasons": {},
-        })
+    if record_context_crops and debug_subsample is not None:
+        raise ValueError("Full-corpus construction cannot subsample approved records")
 
     think_close_ids: list[int] = []
     if mask_think_in_loss:
@@ -215,24 +202,39 @@ def build_dataset(
                 "will be a no-op for every record"
             )
 
-    n_total = len(records)
     raw_temporary = None
     if record_context_crops:
         if __package__:
-            from .full_corpus import full_corpus_raw_dataset
+            from .full_corpus import full_corpus_jsonl_dataset
         else:
-            from full_corpus import full_corpus_raw_dataset
+            from full_corpus import full_corpus_jsonl_dataset
         raw_temporary = tempfile.TemporaryDirectory(prefix="sft-full-raw-")
         try:
-            raw_ds = full_corpus_raw_dataset(records, Path(raw_temporary.name) / "raw.arrow")
+            raw_ds = full_corpus_jsonl_dataset(jsonl_path, Path(raw_temporary.name) / "raw.arrow")
+            if not len(raw_ds):
+                del raw_ds
+                raise ValueError(f"Empty dataset: {jsonl_path}")
         except Exception:
             raw_temporary.cleanup()
             raise
-        # Raw text now lives in the mapped temporary Arrow file, not both a
-        # retained Python corpus and a second giant in-memory Arrow payload.
-        records = []
     else:
+        records = load_jsonl(jsonl_path)
+        if not records:
+            raise ValueError(f"Empty dataset: {jsonl_path}")
+        # Check all rows before subsampling or projecting away the raw columns.
+        for rec in records:
+            validate_sample_weight(rec)
+            rec.pop("sample_weight", None)
+        if debug_subsample:
+            records = records[:debug_subsample]
         raw_ds = Dataset.from_list(records)
+    n_total = len(raw_ds)
+    if validation_stats is not None:
+        validation_stats.update({
+            "records": n_total, "kept": 0, "skipped": 0,
+            "left_truncated_records": 0, "context_tokens_removed": 0,
+            "skip_reasons": {},
+        })
 
     _SKIP = {"input_ids": [], "attention_mask": [], "labels": []}
 

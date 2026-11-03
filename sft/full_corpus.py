@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections import Counter
 from contextlib import ExitStack
 import hashlib
+from itertools import islice
 import json
 import math
 import os
@@ -40,14 +41,16 @@ def full_corpus_raw_dataset(records, arrow_path=None):
     import pyarrow as pa
     from datasets import Dataset
 
-    for record in records:
-        exact_keys(record, {"task", "messages"}, "full-corpus raw row")
-        if record["task"] not in FREQUENCIES or not isinstance(record["messages"], list):
-            raise ValueError("Invalid full-corpus raw task/messages")
-        for message in record["messages"]:
-            exact_keys(message, {"role", "content"}, "full-corpus raw message")
-            if not isinstance(message["role"], str) or not isinstance(message["content"], str):
-                raise ValueError("Full-corpus raw messages require exact text role/content")
+    def validated():
+        for record in records:
+            exact_keys(record, {"task", "messages"}, "full-corpus raw row")
+            if not isinstance(record["task"], str) or record["task"] not in FREQUENCIES or not isinstance(record["messages"], list):
+                raise ValueError("Invalid full-corpus raw task/messages")
+            for message in record["messages"]:
+                exact_keys(message, {"role", "content"}, "full-corpus raw message")
+                if not isinstance(message["role"], str) or not isinstance(message["content"], str):
+                    raise ValueError("Full-corpus raw messages require exact text role/content")
+            yield record
     schema = pa.schema([
         pa.field("task", pa.large_string()),
         pa.field("messages", pa.large_list(pa.struct([
@@ -55,13 +58,28 @@ def full_corpus_raw_dataset(records, arrow_path=None):
         ]))),
     ])
     if arrow_path is None:
-        return Dataset(pa.Table.from_pylist(records, schema=schema))
+        return Dataset(pa.Table.from_pylist(list(validated()), schema=schema))
     # Standard memory-mapped Dataset fingerprinting avoids pickling the entire
     # multi-GiB raw payload while preserving every record in native Arrow.
     with pa.OSFile(str(arrow_path), "wb") as stream, pa.ipc.new_stream(stream, schema) as writer:
-        for start in range(0, len(records), 1024):
-            writer.write_batch(pa.RecordBatch.from_pylist(records[start:start + 1024], schema=schema))
+        iterator = iter(validated())
+        while batch := list(islice(iterator, 1024)):
+            writer.write_batch(pa.RecordBatch.from_pylist(batch, schema=schema))
     return Dataset.from_file(str(arrow_path))
+
+
+def full_corpus_jsonl_dataset(jsonl_path, arrow_path):
+    """Validate and stream full raw rows without retaining a Python corpus."""
+    def records():
+        with Path(jsonl_path).open(encoding="utf-8", buffering=8 * 1024 * 1024) as stream:
+            for index, line in enumerate(stream, 1):
+                if not line.strip():
+                    raise ValueError(f"Blank full-corpus JSONL record in {jsonl_path} at line {index}")
+                try:
+                    yield strict_json_text(line)
+                except ValueError as exc:
+                    raise ValueError(f"Invalid JSON in {jsonl_path} at line {index}") from exc
+    return full_corpus_raw_dataset(records(), arrow_path)
 
 
 def strict_json_text(text):

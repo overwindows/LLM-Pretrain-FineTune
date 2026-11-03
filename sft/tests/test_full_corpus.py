@@ -197,6 +197,10 @@ class FullCorpusContractTests(unittest.TestCase):
             self.assertEqual(list(mapped), raw_rows)
             self.assertEqual(type(mapped.data).__name__, "MemoryMappedTable")
             del mapped
+            streamed = archived.full_corpus_jsonl_dataset(cfg.train_jsonl, Path(tmp) / "streamed.arrow")
+            self.assertEqual(len(streamed), 64)
+            self.assertEqual(list(streamed), [json.loads(line) for line in Path(cfg.train_jsonl).read_text().splitlines()])
+            del streamed
             contract = archived.FullCorpusContract(cfg.full_corpus_contract, cfg)
             cursor = archived.CoverageCursor(contract)
             for step in range(1, 5):
@@ -294,6 +298,59 @@ class FullCorpusContractTests(unittest.TestCase):
                         enable_thinking=False, validation_stats={}, record_context_crops=True,
                     )
             self.assertTrue(all(not path.exists() for path in paths))
+
+    def test_full_raw_streaming_never_calls_legacy_corpus_list_loader_and_rejects_bad_lines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, _ = fixture(tmp)
+            with patch.object(sft_train, "load_jsonl", side_effect=AssertionError("full list forbidden")):
+                stats = {}
+                dataset = build_dataset(
+                    cfg.train_jsonl, CharacterTokenizer(), cfg.max_seq_len,
+                    enable_thinking=False, validation_stats=stats, record_context_crops=True,
+                )
+                self.assertEqual(len(dataset), 64)
+                self.assertEqual(stats["records"], 64)
+            path = Path(tmp) / "bad.jsonl"
+            for content in ("\n", "{}\n", '{"task":\n', '{"task":"gem","task":"hpf","messages":[]}\n'):
+                path.write_text(content)
+                with self.subTest(content=content), self.assertRaises(ValueError):
+                    build_dataset(
+                        str(path), CharacterTokenizer(), 17,
+                        enable_thinking=False, validation_stats={}, record_context_crops=True,
+                    )
+            path.write_text("")
+            with self.assertRaisesRegex(ValueError, "Empty dataset"):
+                build_dataset(
+                    str(path), CharacterTokenizer(), 17,
+                    enable_thinking=False, validation_stats={}, record_context_crops=True,
+                )
+            with self.assertRaisesRegex(ValueError, "cannot subsample"):
+                build_dataset(
+                    cfg.train_jsonl, CharacterTokenizer(), 17, debug_subsample=1,
+                    enable_thinking=False, validation_stats={}, record_context_crops=True,
+                )
+
+    def test_arrow_ipc_consumes_single_pass_generator_in_bounded_batches(self):
+        import pyarrow as pa
+
+        consumed = []
+        def records():
+            for index in range(2050):
+                consumed.append(index)
+                yield {"task": "gem", "messages": [{"role": "user", "content": str(index)}]}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "raw.arrow"
+            mapped = fc.full_corpus_raw_dataset(records(), path)
+            self.assertEqual(len(mapped), 2050)
+            self.assertEqual(consumed, list(range(2050)))
+            with pa.memory_map(str(path)) as stream:
+                self.assertEqual([len(batch) for batch in pa.ipc.open_stream(stream)], [1024, 1024, 2])
+            self.assertEqual(
+                [row["messages"][0]["content"] for row in mapped],
+                [str(index) for index in range(2050)],
+            )
+            del mapped
 
     def test_contract_rejects_wrong_hash_horizon_frequency_permutation_remainder_and_unknown_fields(self):
         with tempfile.TemporaryDirectory() as tmp:

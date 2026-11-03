@@ -496,9 +496,11 @@ rows. Unexpected raw fields/types fail instead of being projected away.
 Ordinary and bounded-diagnostic `Dataset.from_list` construction is unchanged.
 For the full build path, 1024-row Arrow IPC batches are written to a
 per-process owned temporary raw file under the standard `TMPDIR` policy.
+The approved JSONL is streamed directly with strict per-line parsing and
+field validation; no full Python raw-record list is constructed. Blank,
+malformed, duplicate-field or unexpected-field rows fail rather than skip.
 Native `Dataset.from_file` memory-mapped fingerprinting avoids pickling/copying
-the entire multi-GiB raw payload. The Python raw list is released before
-tokenization. Full-mode map/filter explicitly retain the original in-memory
+the entire multi-GiB raw payload. Full-mode map/filter retain the original in-memory
 tokenized-output behavior, so their result never references the temporary
 raw IPC file; the raw mapping is released and the file/directory removed
 on success or error. Transient paths can affect native dataset fingerprints
