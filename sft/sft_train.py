@@ -799,6 +799,27 @@ def main():
         from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
         from transformers import AutoModelForCausalLM
 
+        # Transformers' bitsandbytes integration (replace_with_bnb_linear) swaps
+        # target nn.Linears with bnb.Linear4bit via model.set_submodule(). That
+        # API only exists on torch.nn.Module in torch >= 2.5; the ptca env on the
+        # AML node ships torch 2.4.1 which lacks it, so the 4-bit module swap
+        # dies with "Qwen3_5ForConditionalGeneration ... no attribute
+        # 'set_submodule'". Provide the standard implementation (dotted-path
+        # traversal + _modules assignment) up-front for QLoRA model loading.
+        import torch as _torch
+        if not hasattr(_torch.nn.Module, "set_submodule"):
+            def _set_submodule(self, target, module):
+                parents = target.split(".")
+                if not parents:
+                    raise ValueError(f"Trying to set submodule \"{target}\" but parent is missing or empty")
+                *prefix, last = parents
+                parent = self
+                for name in prefix:
+                    parent = parent.get_submodule(name)
+                parent._modules[last] = module
+
+            _torch.nn.Module.set_submodule = _set_submodule
+
         if cfg.load_in_4bit:
             try:
                 import bitsandbytes as bnb  # noqa: F401
