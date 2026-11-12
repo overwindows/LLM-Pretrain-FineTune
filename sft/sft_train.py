@@ -807,16 +807,28 @@ def main():
                     "load_in_4bit=True requires bitsandbytes; the QLoRA launcher should "
                     "`pip install bitsandbytes` on the GPU node"
                 ) from exc
+            # Use the modern quantization_config path, NOT loose load_in_4bit= kwargs.
+            # In Transformers 5.x, from_pretrained only engages bitsandbytes when a
+            # BitsAndBytesConfig is passed as quantization_config (via get_hf_quantizer
+            # -> replace_with_bnb_linear, which swaps nn.Linear modules class-agnostically).
+            # Loose `load_in_4bit=True` stays in **kwargs and is forwarded straight into
+            # the model class __init__. For qwen3_5 the resolved class is
+            # Qwen3_5ForConditionalGeneration (vision+text), whose __init__(config) does
+            # NOT accept load_in_4bit -> "unexpected keyword argument 'load_in_4bit'".
+            from transformers.utils.quantization_config import BitsAndBytesConfig
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+            )
             model_kwargs = dict(
                 config=model_config,
                 revision=cfg.model_revision,
                 torch_dtype=torch.bfloat16,
                 attn_implementation=cfg.attn_implementation,
                 trust_remote_code=not is_qwen35,
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.bfloat16,
-                bnb_4bit_use_double_quant=True,
+                quantization_config=bnb_config,
                 device_map="auto",
             )
         else:
