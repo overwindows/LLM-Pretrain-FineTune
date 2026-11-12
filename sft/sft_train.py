@@ -142,6 +142,21 @@ class SFTConfig:
     validation_checkpoint_step: int | None = None
     full_corpus_contract: str | None = None
     full_corpus_segment_end_step: int | None = None
+    # --- LoRA / QLoRA (single-GPU) ---
+    # When lora_enabled=true the run is treated as neither `validation` nor
+    # `full_corpus`, so the ZeRO-3-partitioning invariant checks are skipped.
+    # The nf4 base stays frozen on GPU (bitsandbytes), only the small LoRA
+    # adapter is trainable -> no DeepSpeed ZeRO-3 param offload required.
+    lora_enabled: bool = False
+    # load_in_4bit=nf4 (bitsandbytes) quantizes the frozen base to 4-bit on GPU;
+    # load_in_4bit=false keeps a frozen fp16/bf16 base with only LoRA trainable
+    # (plain LoRA, no quantization).
+    load_in_4bit: bool = False
+    lora_r: int = 64
+    lora_alpha: int = 128
+    lora_dropout: float = 0.05
+    # Defaults to the Qwen3-style linear projections when None.
+    lora_target_modules: list[str] | None = None
 
     @classmethod
     def from_yaml(cls, path: str) -> "SFTConfig":
@@ -402,6 +417,19 @@ def main():
     cfg = SFTConfig.from_yaml(args.config)
     if args.override_output_dir:
         cfg.output_dir = args.override_output_dir
+    # QLoRA/LoRA runs use a frozen base (nf4 on GPU with bitsandbytes) plus a
+    # small trainable adapter. They must NOT use the full-dense ZeRO-3 partition
+    # contract: the ZeRO-3-partitioning checks in `validation`/`full_corpus`
+    # only apply to the dense path. When lora_enabled we treat the run as
+    # neither `validation` nor `full_corpus`, so those measurement objects stay
+    # None and their `is_deepspeed_zero3_enabled()` assertions are skipped.
+    if cfg.lora_enabled:
+        if cfg.bounded_validation is not None or cfg.full_corpus_contract is not None:
+            raise ValueError(
+                "LoRA/QLoRA training is incompatible with the bounded-validation / "
+                "full-corpus ZeRO-3 contracts; disable lora_enabled or remove those contracts"
+            )
+        cfg.deepspeed_config = None
     full_corpus = None
     if cfg.full_corpus_contract is not None:
         if (
@@ -763,20 +791,91 @@ def main():
             raise RuntimeError("ZeRO-3 configuration must be active before model loading")
 
     logger.info("Loading model: %s (attn=%s)", cfg.base_model, cfg.attn_implementation)
-    model = model_class.from_pretrained(
-        cfg.base_model,
-        config=model_config,
-        revision=cfg.model_revision,
-        torch_dtype=torch.bfloat16,
-        attn_implementation=cfg.attn_implementation,
-        trust_remote_code=not is_qwen35,
-    )
-    if is_qwen35:
-        configure_qwen35_text_training(model)
-    if cfg.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
-        if hasattr(model, "enable_input_require_grads"):
-            model.enable_input_require_grads()
+    lora_tags = None
+    if cfg.lora_enabled:
+        # QLoRA/LoRA path: frozen base + small trainable adapter, no ZeRO-3.
+        # bitsandbytes provides a cu12 manylinux wheel on PyPI, so the node can
+        # `pip install bitsandbytes` and get nf4 quantized weights on GPU.
+        from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+        from transformers import AutoModelForCausalLM
+
+        if cfg.load_in_4bit:
+            try:
+                import bitsandbytes as bnb  # noqa: F401
+            except ImportError as exc:
+                raise RuntimeError(
+                    "load_in_4bit=True requires bitsandbytes; the QLoRA launcher should "
+                    "`pip install bitsandbytes` on the GPU node"
+                ) from exc
+            model_kwargs = dict(
+                config=model_config,
+                revision=cfg.model_revision,
+                torch_dtype=torch.bfloat16,
+                attn_implementation=cfg.attn_implementation,
+                trust_remote_code=not is_qwen35,
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+                device_map="auto",
+            )
+        else:
+            model_kwargs = dict(
+                config=model_config,
+                revision=cfg.model_revision,
+                torch_dtype=torch.bfloat16,
+                attn_implementation=cfg.attn_implementation,
+                trust_remote_code=not is_qwen35,
+            )
+        # Keep the same class for Qwen3.5 so configure_qwen35_text_training's
+        # class check still holds; use AutoModelForCausalLM for other families.
+        load_class = (model_class if is_qwen35 else AutoModelForCausalLM)
+        model = load_class.from_pretrained(cfg.base_model, **model_kwargs)
+        if is_qwen35:
+            configure_qwen35_text_training(model)
+        model = prepare_model_for_kbit_training(
+            model, use_gradient_checkpointing=cfg.gradient_checkpointing
+        )
+        target_modules = cfg.lora_target_modules or [
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj",
+        ]
+        lora_config = LoraConfig(
+            r=cfg.lora_r,
+            lora_alpha=cfg.lora_alpha,
+            lora_dropout=cfg.lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+            target_modules=target_modules,
+        )
+        model = get_peft_model(model, lora_config)
+        lora_tags = {
+            "peft": "qlora" if cfg.load_in_4bit else "lora",
+            "lora_r": cfg.lora_r,
+            "lora_alpha": cfg.lora_alpha,
+            "lora_dropout": cfg.lora_dropout,
+            "load_in_4bit": cfg.load_in_4bit,
+            "target_modules": target_modules,
+            "trainable_parameters": sum(p.numel() for p in model.parameters() if p.requires_grad),
+        }
+        logger.info("LoRA config active: %s", lora_tags)
+        model.print_trainable_parameters() if hasattr(model, "print_trainable_parameters") else None
+    else:
+        # Full-dense path (unchanged): ZeRO-3 partitioned full model.
+        model = model_class.from_pretrained(
+            cfg.base_model,
+            config=model_config,
+            revision=cfg.model_revision,
+            torch_dtype=torch.bfloat16,
+            attn_implementation=cfg.attn_implementation,
+            trust_remote_code=not is_qwen35,
+        )
+        if is_qwen35:
+            configure_qwen35_text_training(model)
+        if cfg.gradient_checkpointing:
+            model.gradient_checkpointing_enable()
+            if hasattr(model, "enable_input_require_grads"):
+                model.enable_input_require_grads()
     measurements = None
     full_measurements = None
     if full_corpus is not None:
@@ -899,6 +998,7 @@ def main():
                         "model_class": model.__class__.__name__,
                         "model_type": model.config.model_type,
                         "enable_thinking": cfg.enable_thinking,
+                        **({"lora": lora_tags} if lora_tags is not None else {}),
                         "train_jsonl": cfg.train_jsonl,
                         "val_jsonl": cfg.val_jsonl,
                         "best_metric": trainer.state.best_metric,
