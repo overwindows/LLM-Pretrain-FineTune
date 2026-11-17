@@ -104,8 +104,8 @@ if [ "$PTCA_PYMINOR" -ge 9 ]; then
   echo "[env] Step 1a: transformers==4.51.3"
   $PTCA_PIP install --user --ignore-requires-python 'transformers==4.51.3'
 
-  echo "[env] Step 1b: accelerate"
-  $PTCA_PIP install --user --ignore-requires-python 'accelerate'
+  echo "[env] Step 1b: accelerate==1.8.1 (pinned — newer accelerate requires torch>=2.6.0, which breaks the base torch 2.4.1 + torchvision 0.19.1 combo)"
+  $PTCA_PIP install --user --ignore-requires-python 'accelerate==1.8.1'
 
   echo "[env] Step 1c: deepspeed (DS_BUILD_OPS=0 = no CUDA compile, uses JIT)"
   DS_BUILD_OPS=0 $PTCA_PIP install --user --ignore-requires-python 'deepspeed'
