@@ -1,0 +1,47 @@
+$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
+type: command
+display_name: agentic-vllm-HTTP_V031_WAVE6O_T06_P08_FAST_RESAMPLE_K3
+experiment_name: CodeGuru
+description: Qwen3.5-4B HTTP online vLLM 0.31.0 MTP speculative decoding benchmark (modeled on icy_squash_p7jgl867pf in NewsFeedL2_AML)
+compute: azureml:ranking
+environment: azureml:vllm_gemma4:9
+code: .
+inputs:
+  spec_tokens: 3
+  max_num_seqs: 128
+  max_num_batched_tokens: 16384
+  temperature: 0.6
+  top_p: 0.8
+  d2g_stages: 2
+  d2g_tile: 64
+  d2g_warps: 8
+  prompts: 2000
+  datastore:
+    type: uri_folder
+    path: azureml://datastores/adls_msn_dni_09_rankfun/paths/
+    mode: ro_mount
+  model_store:
+    type: uri_folder
+    path: azureml://datastores/copilotexplore_dtalake_id/paths/Gemma-4-26B-A4B-it-deploy-260528
+    mode: ro_mount
+environment_variables:
+  _AZUREML_SINGULARITY_JOB_UAI: /subscriptions/b6dc87f3-c479-49c8-8cb5-7896da3ff895/resourceGroups/AMLStudio/providers/Microsoft.ManagedIdentity/userAssignedIdentities/rankfun_aml
+  TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC: "1800"
+resources:
+  instance_count: 1
+  shm_size: 2g
+limits:
+  timeout: 14400
+command: >-
+  bash -c "
+  export PARAM_SPEC_TOKENS=${{inputs.spec_tokens}} &&
+  export PARAM_MAX_NUM_SEQS=${{inputs.max_num_seqs}} &&
+  export PARAM_MAX_NUM_BATCHED_TOKENS=${{inputs.max_num_batched_tokens}} &&
+  export PARAM_TEMPERATURE=${{inputs.temperature}} &&
+  export PARAM_TOP_P=${{inputs.top_p}} &&
+  export PARAM_D2G_STAGES=${{inputs.d2g_stages}} &&
+  export PARAM_D2G_TILE=${{inputs.d2g_tile}} &&
+  export PARAM_D2G_WARPS=${{inputs.d2g_warps}} &&
+  export PARAM_PROMPTS=${{inputs.prompts}} &&
+  bash ./run_payload.sh
+  "
