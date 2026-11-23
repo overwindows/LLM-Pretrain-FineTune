@@ -5,10 +5,9 @@ experiment_name: LLM-Fine-Tuning
 description: One Unified SLM Qwen3.5-4B pipeline job (modeled on loving_book_n4dfmxlggj in NewsFeedL2_AML)
 compute: azureml:ranking
 environment: azureml:torch251-cuda124-deepspeed-flashattn-training:7
-code: .
+code: ../..
 inputs:
   lr: 5e-6
-  stages: eval
   run_name: one_unified_qwen3_5_4b_v1
   cosmos_data:
     type: uri_folder
@@ -18,10 +17,12 @@ inputs:
     type: uri_file
     path: azureml://datastores/workspaceblobstore/paths/LocalUpload/897d38af8bf0c05c7582e470d3d0e23895731832b1fb74b9cb0cdb3e89afd911/project.yaml
     mode: ro_mount
-  agent_pkg:
+outputs:
+  model_output:
     type: uri_folder
-    path: azureml://datastores/workspaceblobstore/paths/LocalUpload/9bbfe64b6779886580b93b4b26cc412e2eebcf1b95fab1fa8c0886f01c9fa27d/LLM-Fine-Tuning/
-    mode: ro_mount
+    mode: rw_mount
+identity:
+  type: aml_token
 environment_variables:
   WANDB_MODE: disabled
   _AZUREML_SINGULARITY_JOB_UAI: /subscriptions/b6dc87f3-c479-49c8-8cb5-7896da3ff895/resourceGroups/AMLStudio/providers/Microsoft.ManagedIdentity/userAssignedIdentities/rankfun_aml
@@ -30,27 +31,9 @@ resources:
 limits:
   timeout: 86400
 command: >-
-  bash -e -c "
-  echo '[Step 1/4] Cloning https://github.com/overwindows/LLM-Pretrain-FineTune.git@qlora-sft-path...' &&
-  git clone --depth=1 --branch qlora-sft-path https://github.com/overwindows/LLM-Pretrain-FineTune.git /tmp/gpu_code &&
-  echo '[Step 2/4] Installing dependencies...' &&
-  PTCA_PY=/opt/conda/envs/ptca/bin/python &&
-  PTCA_PYVER=\$($PTCA_PY -c 'import sys; print(f\"{sys.version_info.major}.{sys.version_info.minor}\")') &&
-  export PYTHONUSERBASE=/tmp/ptca_user &&
-  export PYTHONPATH=/tmp/ptca_user/lib/python\${PTCA_PYVER}/site-packages:\${PYTHONPATH:-} &&
-  \$PTCA_PY -m pip install --user 'pyarrow==24.0.0' &&
-  bash /tmp/gpu_code/scripts/setup_env.sh &&
-  \$PTCA_PY -m pip install --user 'transformers==5.2.0' 'accelerate==1.8.1' 'deepspeed==0.15.4' 'openai' &&
-  echo '[Step 3/4] Configuring environment...' &&
-  export EASYTRAIN_ROOT=/tmp/gpu_code &&
-  export AGENTIC_RUN_NAME=${{inputs.run_name}} &&
-  PROJECT_YAML=\${{inputs.project_yaml_file}} &&
-  AGENT_PKG=\${{inputs.agent_pkg}} &&
-  cp -R \"\$AGENT_PKG/agent\" /tmp/gpu_code/ &&
-  cp \"\$AGENT_PKG/scripts/run_pipeline.py\" /tmp/gpu_code/scripts/ &&
-  cp -R \"\$AGENT_PKG/tasks\" /tmp/gpu_code/ 2>/dev/null || true &&
-  mkdir -p /tmp/gpu_code/configs && cp -R \"\$AGENT_PKG/configs\" /tmp/gpu_code/ 2>/dev/null || true &&
-  sed -e 's|easytrain_root:.*|easytrain_root: \"/tmp/gpu_code\"|' \"\$PROJECT_YAML\" > /tmp/gpu_code/project_runtime.yaml &&
-  echo '[Step 4/4] Running pipeline (lr=${{inputs.lr}}, stages=${{inputs.stages}})...' &&
-  \$PTCA_PY /tmp/gpu_code/scripts/run_pipeline.py --project /tmp/gpu_code/project_runtime.yaml --stages ${{inputs.stages}} --set sft.learning_rate=${{inputs.lr}}
-  "
+  bash campaigns/one_unified_qwen35/run_sft.sh
+  "${{inputs.lr}}"
+  "${{inputs.run_name}}"
+  "${{inputs.cosmos_data}}"
+  "${{inputs.project_yaml_file}}"
+  "${{outputs.model_output}}"
