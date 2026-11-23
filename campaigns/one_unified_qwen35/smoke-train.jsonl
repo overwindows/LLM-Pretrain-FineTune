@@ -1,0 +1,16 @@
+{"messages":[{"role":"system","content":"Answer the addition question with only the integer."},{"role":"user","content":"What is 1 + 2?"},{"role":"assistant","content":"3"}]}
+{"messages":[{"role":"system","content":"Answer the addition question with only the integer."},{"role":"user","content":"What is 2 + 4?"},{"role":"assistant","content":"6"}]}
+{"messages":[{"role":"system","content":"Answer the addition question with only the integer."},{"role":"user","content":"What is 3 + 4?"},{"role":"assistant","content":"7"}]}
+{"messages":[{"role":"system","content":"Answer the addition question with only the integer."},{"role":"user","content":"What is 4 + 5?"},{"role":"assistant","content":"9"}]}
+{"messages":[{"role":"system","content":"Answer the addition question with only the integer."},{"role":"user","content":"What is 5 + 7?"},{"role":"assistant","content":"12"}]}
+{"messages":[{"role":"system","content":"Answer the addition question with only the integer."},{"role":"user","content":"What is 6 + 9?"},{"role":"assistant","content":"15"}]}
+{"messages":[{"role":"system","content":"Answer the addition question with only the integer."},{"role":"user","content":"What is 7 + 10?"},{"role":"assistant","content":"17"}]}
+{"messages":[{"role":"system","content":"Answer the addition question with only the integer."},{"role":"user","content":"What is 8 + 11?"},{"role":"assistant","content":"19"}]}
+{"messages":[{"role":"system","content":"Answer the addition question with only the integer."},{"role":"user","content":"What is 9 + 12?"},{"role":"assistant","content":"21"}]}
+{"messages":[{"role":"system","content":"Answer the addition question with only the integer."},{"role":"user","content":"What is 10 + 13?"},{"role":"assistant","content":"23"}]}
+{"messages":[{"role":"system","content":"Answer the addition question with only the integer."},{"role":"user","content":"What is 11 + 14?"},{"role":"assistant","content":"25"}]}
+{"messages":[{"role":"system","content":"Answer the addition question with only the integer."},{"role":"user","content":"What is 12 + 15?"},{"role":"assistant","content":"27"}]}
+{"messages":[{"role":"system","content":"Answer the addition question with only the integer."},{"role":"user","content":"What is 13 + 16?"},{"role":"assistant","content":"29"}]}
+{"messages":[{"role":"system","content":"Answer the addition question with only the integer."},{"role":"user","content":"What is 14 + 17?"},{"role":"assistant","content":"31"}]}
+{"messages":[{"role":"system","content":"Answer the addition question with only the integer."},{"role":"user","content":"What is 15 + 18?"},{"role":"assistant","content":"33"}]}
+{"messages":[{"role":"system","content":"Answer the addition question with only the integer."},{"role":"user","content":"What is 16 + 19?"},{"role":"assistant","content":"35"}]}

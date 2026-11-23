@@ -1,0 +1,46 @@
+$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
+type: command
+display_name: one-unified-qwen35-singularity-smoke
+experiment_name: LLM-Fine-Tuning
+description: One Unified Qwen3.5 QLoRA smoke run with synthetic train and validation data
+compute: /subscriptions/b6dc87f3-c479-49c8-8cb5-7896da3ff895/resourceGroups/rg-cs-ranking-ml-singularity/providers/Microsoft.MachineLearningServices/virtualClusters/ranking
+environment: azureml:torch251-cuda124-deepspeed-flashattn-training:7
+code: ../..
+inputs:
+  lr: 5e-6
+  run_name: one_unified_qwen3_5_4b_v1
+  cosmos_data:
+    type: uri_folder
+    path: azureml://datastores/maiprofilev3_gen2/paths/
+    mode: ro_mount
+  project_yaml_file:
+    type: uri_file
+    path: azureml://datastores/workspaceblobstore/paths/LocalUpload/897d38af8bf0c05c7582e470d3d0e23895731832b1fb74b9cb0cdb3e89afd911/project.yaml
+    mode: ro_mount
+outputs:
+  model_output:
+    type: uri_folder
+    mode: rw_mount
+environment_variables:
+  WANDB_MODE: disabled
+  _AZUREML_SINGULARITY_JOB_UAI: /subscriptions/b6dc87f3-c479-49c8-8cb5-7896da3ff895/resourceGroups/AMLStudio/providers/Microsoft.ManagedIdentity/userAssignedIdentities/rankfun_aml
+resources:
+  instance_count: 1
+  instance_type: Singularity.ND12am_A100_v4
+  shm_size: 2g
+  properties:
+    AISuperComputer:
+      enableAzmlInt: false
+      locations: [ukwest]
+      priority: High
+      slaTier: Premium
+limits:
+  timeout: 3600
+command: >-
+  bash campaigns/one_unified_qwen35/run_sft.sh
+  "${{inputs.lr}}"
+  "${{inputs.run_name}}"
+  "${{inputs.cosmos_data}}"
+  "${{inputs.project_yaml_file}}"
+  "${{outputs.model_output}}"
+  --smoke-data

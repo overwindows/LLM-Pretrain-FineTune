@@ -16,12 +16,19 @@ sys.path.insert(0, str(ROOT))
 from agent.pipeline import _resolve_vars
 
 
-def training_config(lr, run_name, cosmos_root, project_yaml, output_dir):
+def training_config(lr, run_name, cosmos_root, project_yaml, output_dir, smoke_data=False):
     if not math.isfinite(lr) or lr <= 0:
         raise ValueError("Learning rate must be finite and positive")
     project = yaml.safe_load(project_yaml.read_text(encoding="utf-8"))
     project = _resolve_vars(project, {"cosmos_root": str(cosmos_root), "run_name": run_name})
-    data = project["data"]
+    if smoke_data:
+        smoke_dir = Path(__file__).resolve().parent
+        data = {
+            "sft_train_jsonl": str(smoke_dir / "smoke-train.jsonl"),
+            "sft_val_jsonl": str(smoke_dir / "smoke-val.jsonl"),
+        }
+    else:
+        data = project["data"]
     config = yaml.safe_load(
         (ROOT / "sft/configs/sft/qwen35_text.yaml.tmpl").read_text(encoding="utf-8")
     )
@@ -57,12 +64,15 @@ def main():
     parser.add_argument("cosmos_root", type=Path)
     parser.add_argument("project_yaml", type=Path)
     parser.add_argument("output_dir", type=Path)
+    parser.add_argument("--smoke-data", action="store_true")
     args = parser.parse_args()
 
     output_dir = args.output_dir.resolve()
     if output_dir.exists() and any(output_dir.iterdir()):
         raise ValueError("The candidate output directory must be empty before training")
-    config = training_config(args.lr, args.run_name, args.cosmos_root, args.project_yaml, output_dir)
+    config = training_config(
+        args.lr, args.run_name, args.cosmos_root, args.project_yaml, output_dir, args.smoke_data,
+    )
     with tempfile.TemporaryDirectory() as work_dir:
         config_path = Path(work_dir) / "sft.yaml"
         config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
