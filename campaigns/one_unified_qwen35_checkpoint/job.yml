@@ -1,0 +1,45 @@
+$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
+type: command
+display_name: qwen35-mai-profile-score
+experiment_name: LLM-Fine-Tuning
+description: Merge an existing Qwen3.5 LoRA checkpoint and score its MAI Profile validation predictions.
+code: ../..
+compute: azureml:/subscriptions/b6dc87f3-c479-49c8-8cb5-7896da3ff895/resourceGroups/rg-cs-ranking-ml-singularity/providers/Microsoft.MachineLearningServices/virtualClusters/ranking
+environment: azureml:torch251-cuda124-deepspeed-flashattn-training:7
+inputs:
+  checkpoint: checkpoint-3000
+  cosmos_data:
+    type: uri_folder
+    path: azureml://datastores/maiprofilev3_gen2/paths/
+    mode: ro_mount
+  project_yaml_file:
+    type: uri_file
+    path: azureml://datastores/workspaceblobstore/paths/LocalUpload/4793b9d77faa2b9fa5bab51776b0ad9fe2bfa88b246ec6574dfb360da0172ec9/project.yaml
+    mode: ro_mount
+  agent_pkg:
+    type: uri_folder
+    path: azureml://datastores/workspaceblobstore/paths/LocalUpload/61469e00158a85ee50a57024260b977109bb5ba309bf1c45abf74be3f9a168bb/LLM-Fine-Tuning/
+    mode: ro_mount
+outputs:
+  metrics:
+    type: uri_folder
+    mode: rw_mount
+environment_variables:
+  WANDB_MODE: disabled
+  _AZUREML_SINGULARITY_JOB_UAI: /subscriptions/b6dc87f3-c479-49c8-8cb5-7896da3ff895/resourceGroups/AMLStudio/providers/Microsoft.ManagedIdentity/userAssignedIdentities/rankfun_aml
+resources:
+  instance_count: 1
+  instance_type: Singularity.ND12am_A100_v4
+  shm_size: 2g
+  properties:
+    AISuperComputer:
+      enableAzmlInt: false
+      locations: [ukwest]
+      priority: High
+      slaTier: Premium
+limits:
+  timeout: 43200
+command: >-
+  bash campaigns/one_unified_qwen35_checkpoint/run.sh
+  "${{inputs.checkpoint}}" "${{inputs.cosmos_data}}"
+  "${{inputs.project_yaml_file}}" "${{inputs.agent_pkg}}" "${{outputs.metrics}}"
